@@ -2,11 +2,10 @@ CC ?= gcc
 XCC = $(CROSS_COMPILE)$(CC)
 CFLAGS ?= -Os -Wall -Wextra -ggdb3
 LDFLAGS += 
-LDXTRA += 
 LDSLNK = $(LDFLAGS) -static
-LDXSLN = $(LDXTRA) -static
 MAKE ?= make
 STRIP ?= strip
+XSTRIP = $(CROSS_COMPILE)$(STRIP)
 CP ?= cp
 RM ?= rm -f
 EXES = stdansi
@@ -24,14 +23,14 @@ cross:
 
 $(EXES): $(DBGX)
 	$(CP) $< $@
-	$(STRIP) $@
+	$(XSTRIP) $@
 
 $(DBGX): $(OBJS)
 	$(XCC) -o $@ $^ $(LDFLAGS)
 
 $(SLNK): $(OBJS)
 	$(XCC) -o $@ $^ $(LDSLNK)
-	$(STRIP) $@
+	$(XSTRIP) $@
 
 $(OBJS): $(SRCS)
 	$(XCC) -c -o $@ $< $(CFLAGS)

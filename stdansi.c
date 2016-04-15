@@ -1,5 +1,5 @@
 /*
-	This file is part of icmpdsl.
+	This file is part of stdansi.
 	Copyright (C) 2016, Robert L. Thompson
 
 	This program is free software: you can redistribute it and/or modify
@@ -15,6 +15,10 @@
 	You should have received a copy of the GNU General Public License
 	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+
+/* Highlight standard error, inspired by https://github.com/charliesome/errexec */
+
+#define _GNU_SOURCE
 #include <sys/uio.h>
 #include <sys/select.h>
 #include <sys/time.h>
@@ -27,32 +31,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-static size_t readfd(int *fdp, char *buf, size_t size)
-{
-	size_t ret = 0;
-	ssize_t len;
-	int fd = *fdp;
-
-	len = read(fd, buf, size);
-	if (len < 0) {
-		if (errno == EINTR)
-			goto out;
-		perror("read()");
-		close(fd);
-		*fdp = -1;
-		goto out;
-	}
-	if (len == 0) {
-		close(fd);
-		*fdp = -1;
-		goto out;
-	}
-
-	ret = len;
-out:
-	return ret;
-}
-
 static bool writeiov(int fd, struct iovec *iov, unsigned niov)
 {
 	bool ret = false;
@@ -63,7 +41,7 @@ static bool writeiov(int fd, struct iovec *iov, unsigned niov)
 		if (len < 0) {
 			if (errno == EINTR)
 				continue;
-			perror("write()");
+			perror("writev()");
 			goto fail;
 		}
 		do {
@@ -83,9 +61,66 @@ fail:
 	return ret;
 }
 
-static bool writeansi(bool *color, bool want, int fda, const char *ansi, size_t size, int fdb, const char *buf, size_t len)
+#ifdef SPLICE_F_NONBLOCK
+static bool writeansi(int *fdp, bool *color, bool want, int fda, const char *ansi, size_t size, int fdb)
 {
 	bool ret = false;
+	ssize_t len;
+	struct iovec iov;
+
+	if (*color != want) {
+		*color = want;
+		iov.iov_base = (void *)ansi;
+		iov.iov_len = size;
+		if (!writeiov(fda, &iov, 1))
+			goto fail;
+	}
+	if (fdp != NULL) {
+		len = splice(*fdp, NULL, fdb, NULL, 65536, SPLICE_F_NONBLOCK);
+		if (len < 0 && errno != EINTR) {
+			perror("splice()");
+			goto fail;
+		}
+		if (len == 0) {
+			close(*fdp);
+			*fdp = -1;
+		}
+	}
+
+	ret = true;
+fail:
+	return ret;
+}
+#else
+static size_t readfd(int *fdp, char *buf, size_t size)
+{
+	size_t ret = 0;
+	ssize_t len;
+	int fd = *fdp;
+
+	len = read(fd, buf, size);
+	if (len < 0) {
+		if (errno == EINTR)
+			goto out;
+		perror("read()");
+		goto out;
+	}
+	if (len == 0) {
+		close(fd);
+		*fdp = -1;
+		goto out;
+	}
+
+	ret = len;
+out:
+	return ret;
+}
+
+static bool writeansi(int *fdp, bool *color, bool want, int fda, const char *ansi, size_t size, int fdb)
+{
+	bool ret = false;
+	size_t len = 0;
+	char buf[4096];
 	struct iovec iov[2];
 	unsigned niov = 0;
 
@@ -100,10 +135,13 @@ static bool writeansi(bool *color, bool want, int fda, const char *ansi, size_t 
 			niov = 0;
 		}
 	}
-	if (len > 0) {
-		iov[niov].iov_base = (void *)buf;
-		iov[niov].iov_len = len;
-		niov++;
+	if (fdp != NULL) {
+		len = readfd(fdp, buf, sizeof buf);
+		if (len > 0) {
+			iov[niov].iov_base = (void *)buf;
+			iov[niov].iov_len = len;
+			niov++;
+		}
 	}
 	if (niov > 0 && !writeiov(fdb, iov, niov))
 		goto fail;
@@ -112,17 +150,16 @@ static bool writeansi(bool *color, bool want, int fda, const char *ansi, size_t 
 fail:
 	return ret;
 }
+#endif
 
-static bool writecolor(int *fdp, fd_set *fdset, bool *color, bool want, int fda, int fdb, char *buf, size_t size)
+static bool writecolor(int *fdp, bool *color, bool want, int fda, int fdb)
 {
 	bool ret = false;
 	static const char highlight[] = "\x1b[31;1m", restore[] = "\x1b[0m";
 	const char *ansi = want ? highlight : restore;
-	size_t len = 0, pick = want ? sizeof highlight : sizeof restore;
+	size_t pick = want ? sizeof highlight : sizeof restore;
 
-	if ((fdp == NULL || (*fdp >= 0 && FD_ISSET(*fdp, fdset)
-	&& (len = readfd(fdp, buf, size)) > 0))
-	&& !writeansi(color, want, fda, ansi, pick - 1, fdb, buf, len))
+	if (!writeansi(fdp, color, want, fda, ansi, pick - 1, fdb))
 		goto fail;
 
 	ret = true;
@@ -130,7 +167,7 @@ fail:
 	return ret;
 }
 
-static bool writestuff(int *fdro, int *fdre, fd_set *fdset, bool *color, int fdwo, int fdwe, char *buf, size_t size)
+static bool writestuff(int *fdro, int *fdre, fd_set *fdset, bool *color, int fdwo, int fdwe)
 {
 	bool ret, state;
 	unsigned i;
@@ -144,7 +181,9 @@ static bool writestuff(int *fdro, int *fdre, fd_set *fdset, bool *color, int fdw
 			fdp = fdro;
 			fdb = fdwo;
 		}
-		ret = writecolor(fdp, fdset, color, state, fdwe, fdb, buf, size);
+		if (fdp != NULL && (*fdp < 0 || !FD_ISSET(*fdp, fdset)))
+			fdp = NULL;
+		ret = writecolor(fdp, color, state, fdwe, fdb);
 	}
 
 	return ret;
@@ -153,19 +192,19 @@ static bool writestuff(int *fdro, int *fdre, fd_set *fdset, bool *color, int fdw
 int main(int argc, char **argv)
 {
 	int ret = EXIT_FAILURE, nfds, flags, fd, outpipe[2], errpipe[2];
+	const int fdin = STDIN_FILENO, fdout = STDOUT_FILENO, fderr = STDERR_FILENO;
 	bool color = false;
 	FILE *fp;
 	pid_t pid;
 	sigset_t sigset;
 	fd_set fdset;
-	char buf[4096];
 
 	if (argc < 2) {
 		fprintf(stderr, "%s command [ args ]\n", argv[0]);
 		goto fail;
 	}
 
-	if (isatty(STDOUT_FILENO) != 1 && isatty(STDERR_FILENO) != 1) {
+	if (isatty(fderr) != 1) {
 		(void)execvp(argv[1], argv + 1);
 		fprintf(stderr, "execvp() failed\n");
 		goto fail;
@@ -176,33 +215,18 @@ int main(int argc, char **argv)
 		goto fail;
 	}
 
-	if (sigemptyset(&sigset) != 0) {
-		perror("sigemptyset()");
-		goto fail;
-	}
-
-	if (sigaddset(&sigset, SIGPIPE) != 0) {
-		perror("sigaddset()");
-		goto fail;
-	}
-
-	if (sigprocmask(SIG_BLOCK, &sigset, NULL) != 0) {
-		perror("sigprocmask()");
-		goto fail;
-	}
-
 	pid = fork();
 	if (pid < 0) {
 		perror("fork()");
 		goto fail;
 	}
 
-	if (pid != 0) {
+	if (pid == 0) {
 		close(outpipe[0]);
 		close(errpipe[0]);
-		fd = dup(STDERR_FILENO);
-		if (dup2(outpipe[1], STDOUT_FILENO) < 0
-		|| dup2(errpipe[1], STDERR_FILENO) < 0) {
+		fd = dup(fderr);
+		if (dup2(outpipe[1], fdout) < 0
+		|| dup2(errpipe[1], fderr) < 0) {
 			perror("dup2()");
 			goto fail;
 		}
@@ -224,7 +248,22 @@ int main(int argc, char **argv)
 		goto fail;
 	}
 
-	close(STDIN_FILENO);
+	if (sigemptyset(&sigset) != 0) {
+		perror("sigemptyset()");
+		goto fail;
+	}
+
+	if (sigaddset(&sigset, SIGPIPE) != 0) {
+		perror("sigaddset()");
+		goto fail;
+	}
+
+	if (sigprocmask(SIG_BLOCK, &sigset, NULL) != 0) {
+		perror("sigprocmask()");
+		goto fail;
+	}
+
+	close(fdin);
 	close(outpipe[1]);
 	close(errpipe[1]);
 
@@ -248,13 +287,13 @@ int main(int argc, char **argv)
 		}
 		if (nfds == 0)
 			continue;
-		if (!writestuff(&outpipe[0], &errpipe[0], &fdset, &color, STDOUT_FILENO, STDERR_FILENO, buf, sizeof buf))
+		if (!writestuff(&outpipe[0], &errpipe[0], &fdset, &color, fdout, fderr))
 			goto fail;
 	}
 
 	ret = EXIT_SUCCESS;
 fail:
-	if (!writecolor(NULL, NULL, &color, false, STDERR_FILENO, -1, NULL, 0))
+	if (!writecolor(NULL, &color, false, fderr, -1))
 		ret = EXIT_FAILURE;
 	return ret;
 }
