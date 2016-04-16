@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdio.h>
 
 static bool writeiov(int fd, struct iovec *iov, unsigned niov)
@@ -62,14 +63,14 @@ fail:
 }
 
 #ifdef SPLICE_F_NONBLOCK
-static bool writeansi(int *fdp, bool *color, bool want, int fda, const char *ansi, size_t size, int fdb)
+static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ansi, size_t size, int fdb)
 {
 	bool ret = false;
 	ssize_t len;
 	struct iovec iov;
 
-	if (*color != want) {
-		*color = want;
+	if (*is_on != want) {
+		*is_on = want;
 		iov.iov_base = (void *)ansi;
 		iov.iov_len = size;
 		if (!writeiov(fda, &iov, 1))
@@ -116,7 +117,7 @@ out:
 	return ret;
 }
 
-static bool writeansi(int *fdp, bool *color, bool want, int fda, const char *ansi, size_t size, int fdb)
+static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ansi, size_t size, int fdb)
 {
 	bool ret = false;
 	size_t len = 0;
@@ -124,8 +125,8 @@ static bool writeansi(int *fdp, bool *color, bool want, int fda, const char *ans
 	struct iovec iov[2];
 	unsigned niov = 0;
 
-	if (*color != want) {
-		*color = want;
+	if (*is_on != want) {
+		*is_on = want;
 		iov[niov].iov_base = (void *)ansi;
 		iov[niov].iov_len = size;
 		niov++;
@@ -152,14 +153,16 @@ fail:
 }
 #endif
 
-static bool writecolor(int *fdp, bool *color, bool want, int fda, int fdb)
+static bool writecolor(int *fdp, const char *code, bool *is_on, bool want, int fda, int fdb)
 {
 	bool ret = false;
-	static const char highlight[] = "\x1b[31;1m", restore[] = "\x1b[0m";
+	char highlight[8];
+	static const char restore[] = "\x1b[0m";
 	const char *ansi = want ? highlight : restore;
 	size_t pick = want ? sizeof highlight : sizeof restore;
 
-	if (!writeansi(fdp, color, want, fda, ansi, pick - 1, fdb))
+	snprintf(highlight, sizeof highlight, "\x1b[%s;1m", code);
+	if (!writeansi(fdp, is_on, want, fda, ansi, pick - 1, fdb))
 		goto fail;
 
 	ret = true;
@@ -167,50 +170,178 @@ fail:
 	return ret;
 }
 
-static bool writestuff(int *fdro, int *fdre, fd_set *fdset, bool *color, int fdwo, int fdwe)
+enum stdidx {
+	STDIN,
+	STDOUT,
+	STDERR,
+	STDNUM
+};
+
+enum {
+	PIPEOUT,
+	PIPEERR,
+	PIPENUM
+};
+
+enum {
+	PIPERD,
+	PIPEWR,
+	PIPEOPS
+};
+
+static bool writestuff(int fdpipe[PIPENUM][PIPEOPS], fd_set *fdset, const char *code, bool *is_on, const int fdstd[STDNUM])
 {
 	bool ret, state;
 	unsigned i;
 	int fdb, *fdp;
 
-	for (i = 0, ret = true, state = *color; i < 2 && ret; i++, state = !state) {
+	for (i = 0, ret = true, state = *is_on; i < 2 && ret; i++, state = !state) {
 		if (state) {
-			fdp = fdre;
-			fdb = fdwe;
+			fdp = &fdpipe[PIPEERR][PIPERD];
+			fdb = fdstd[STDERR];
 		} else {
-			fdp = fdro;
-			fdb = fdwo;
+			fdp = &fdpipe[PIPEOUT][PIPERD];
+			fdb = fdstd[STDOUT];
 		}
 		if (fdp != NULL && (*fdp < 0 || !FD_ISSET(*fdp, fdset)))
 			fdp = NULL;
-		ret = writecolor(fdp, color, state, fdwe, fdb);
+		ret = writecolor(fdp, code, is_on, state, fdstd[STDERR], fdb);
 	}
 
 	return ret;
 }
 
+static void exec_child(char *const argv[], int fdpipe[PIPENUM][PIPEOPS], const int fdstd[STDNUM])
+{
+	int flags, fd = -1;
+	FILE *fp;
+
+	close(fdpipe[PIPEOUT][PIPERD]);
+	close(fdpipe[PIPEERR][PIPERD]);
+	fd = dup(fdstd[STDERR]);
+	if (dup2(fdpipe[PIPEOUT][PIPEWR], fdstd[STDOUT]) < 0
+	|| dup2(fdpipe[PIPEERR][PIPEWR], fdstd[STDERR]) < 0) {
+		perror("dup2()");
+		return;
+	}
+	close(fdpipe[PIPEOUT][PIPEWR]);
+	close(fdpipe[PIPEERR][PIPEWR]);
+	if (fd >= 0) {
+		flags = fcntl(fd, F_GETFD);
+		if (flags >= 0)
+			(void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+	}
+	(void)execvp(argv[0], argv);
+	if (fd < 0)
+		return;
+	fp = fdopen(fd, "a");
+	if (fp == NULL)
+		return;
+	fprintf(fp, "execvp() failed\n");
+	fclose(fp);
+}
+
+static void fdset_add(int *fdpmax, fd_set *fdset, int fd)
+{
+	if (fd >= 0) {
+		FD_SET(fd, fdset);
+		if (*fdpmax < fd)
+			*fdpmax = fd;
+	}
+}
+
+enum ansi_color {
+	COLOR_BLACK,
+	COLOR_RED,
+	COLOR_GREEN,
+	COLOR_YELLOW,
+	COLOR_BLUE,
+	COLOR_MAGENTA,
+	COLOR_CYAN,
+	COLOR_WHITE,
+};
+
+#ifndef COLOR_DEFAULT
+#define COLOR_DEFAULT	COLOR_RED
+#endif
+
+#define ARRAY_LEN(a)	(sizeof(a)/sizeof(*(a)))
+
+static bool color_output(int fdpipe[PIPENUM][PIPEOPS], const int fdstd[STDNUM], const char *name)
+{
+	bool ret = false, is_on = false;
+	int nfds = -1;
+	fd_set fdset;
+	char code[3];
+	const char *ptr, **pstr;
+	size_t len, namelen;
+	static const char *palette[] = {	[COLOR_BLACK] = "black", [COLOR_RED] = "red",
+						[COLOR_GREEN] = "green", [COLOR_YELLOW] = "yellow",
+						[COLOR_BLUE] = "blue", [COLOR_MAGENTA] = "magenta",
+						[COLOR_CYAN] = "cyan", [COLOR_WHITE] = "white" };
+	enum ansi_color entries = ARRAY_LEN(palette), color = entries;
+
+	close(fdstd[STDIN]);
+	close(fdpipe[PIPEOUT][PIPEWR]);
+	close(fdpipe[PIPEERR][PIPEWR]);
+
+	if (name != NULL) {
+		namelen = strlen(name);
+		for (color = 0, pstr = palette, ptr = name + namelen; color < entries; color++, pstr++)
+			if (namelen >= (len = strlen(*pstr)) && strcmp(*pstr, ptr - len) == 0)
+				break;
+	}
+	if (color >= entries)
+		color = COLOR_DEFAULT;
+	snprintf(code, sizeof code, "3%u", color);
+
+	while (true) {
+		nfds = -1;
+		FD_ZERO(&fdset);
+		fdset_add(&nfds, &fdset, fdpipe[PIPEOUT][PIPERD]);
+		fdset_add(&nfds, &fdset, fdpipe[PIPEERR][PIPERD]);
+		if (nfds < 0)
+			break;
+		nfds = select(nfds + 1, &fdset, NULL, NULL, NULL);
+		if (nfds < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("select()");
+			goto fail;
+		}
+		if (nfds == 0)
+			continue;
+		if (!writestuff(fdpipe, &fdset, code, &is_on, fdstd))
+			goto fail;
+	}
+
+	ret = true;
+fail:
+	if (!writecolor(NULL, code, &is_on, false, fdstd[STDERR], -1))
+		ret = EXIT_FAILURE;
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
-	int ret = EXIT_FAILURE, nfds, flags, fd, outpipe[2], errpipe[2];
-	const int fdin = STDIN_FILENO, fdout = STDOUT_FILENO, fderr = STDERR_FILENO;
-	bool color = false;
-	FILE *fp;
+	int ret = EXIT_FAILURE, fdpipe[PIPENUM][PIPEOPS] = {{-1, -1}, {-1, -1}};
+	const int fdstd[STDNUM] = {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
+	char *const *arga = argv + 1;
 	pid_t pid;
 	sigset_t sigset;
-	fd_set fdset;
 
 	if (argc < 2) {
 		fprintf(stderr, "%s command [ args ]\n", argv[0]);
 		goto fail;
 	}
 
-	if (isatty(fderr) != 1) {
-		(void)execvp(argv[1], argv + 1);
+	if (isatty(fdstd[STDERR]) != 1) {
+		(void)execvp(arga[0], arga);
 		fprintf(stderr, "execvp() failed\n");
 		goto fail;
 	}
 
-	if (pipe(outpipe) != 0 || pipe(errpipe) != 0) {
+	if (pipe(fdpipe[PIPEOUT]) != 0 || pipe(fdpipe[PIPEERR]) != 0) {
 		perror("pipe()");
 		goto fail;
 	}
@@ -222,29 +353,7 @@ int main(int argc, char **argv)
 	}
 
 	if (pid == 0) {
-		close(outpipe[0]);
-		close(errpipe[0]);
-		fd = dup(fderr);
-		if (dup2(outpipe[1], fdout) < 0
-		|| dup2(errpipe[1], fderr) < 0) {
-			perror("dup2()");
-			goto fail;
-		}
-		close(outpipe[1]);
-		close(errpipe[1]);
-		if (fd >= 0) {
-			flags = fcntl(fd, F_GETFD);
-			if (flags >= 0)
-				(void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-		}
-		(void)execvp(argv[1], argv + 1);
-		if (fd < 0)
-			goto fail;
-		fp = fdopen(fd, "a");
-		if (fp == NULL)
-			goto fail;
-		fprintf(fp, "execvp() failed\n");
-		fclose(fp);
+		exec_child(arga, fdpipe, fdstd);
 		goto fail;
 	}
 
@@ -263,37 +372,10 @@ int main(int argc, char **argv)
 		goto fail;
 	}
 
-	close(fdin);
-	close(outpipe[1]);
-	close(errpipe[1]);
-
-	while (true) {
-		FD_ZERO(&fdset);
-		if (outpipe[0] >= 0)
-			FD_SET(outpipe[0], &fdset);
-		if (errpipe[0] >= 0)
-			FD_SET(errpipe[0], &fdset);
-		nfds = outpipe[0];
-		if (nfds < errpipe[0])
-			nfds = errpipe[0];
-		if (nfds < 0)
-			break;
-		nfds = select(nfds + 1, &fdset, NULL, NULL, NULL);
-		if (nfds < 0) {
-			if (errno == EINTR)
-				continue;
-			perror("select()");
-			goto fail;
-		}
-		if (nfds == 0)
-			continue;
-		if (!writestuff(&outpipe[0], &errpipe[0], &fdset, &color, fdout, fderr))
-			goto fail;
-	}
+	if (!color_output(fdpipe, fdstd, argv[0]))
+		goto fail;
 
 	ret = EXIT_SUCCESS;
 fail:
-	if (!writecolor(NULL, &color, false, fderr, -1))
-		ret = EXIT_FAILURE;
 	return ret;
 }
