@@ -6,15 +6,16 @@ Run a program with stdansi to highlight its standard error stream.
 Free zeroed blocks in files with resparse.
 
 Discard a block device with dbz and check if it will returns zeroes.
+This improves imaging speed especially when zeroed blocks can be skipped.
 	devname="mmcblkX"
 	devpath="/dev/$devname"
 	sysgran="/sys/block/$devname/queue/discard_granularity"
 	bsz=0
 	[[ -r "$sysgran" ]] && bsz="`< "$sysgran"`"
-	[[ "$bsz" -lt 4096 ]] && bsz=4194304
+	[[ "$bsz" -lt 1048576 ]] && bsz=4194304
 	./dbz -d "$devpath"
 	./dbz -q && z=1
-	dd if=/path/to/disk.img bs=$bsz ${z:+conv=sparse} of="$devpath"
+	pv -ptrabfeWB "$bsz" /path/to/disk.img | dd iflag=fullblock bs="$bsz" ${z:+"conv=sparse"} oflag=direct of="$devpath"
 
 Use LD_PRELOAD with libnocache to avoid caching file content in memory, and
 with libmadvmerge to mark identical user memory pages as mergeable for KSM.
