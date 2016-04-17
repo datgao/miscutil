@@ -1,0 +1,20 @@
+Run make to build any or all of the components.  (There is no install target.)
+32-bit sub-architecture and cross compiles are supported.
+
+Run a program with stdansi to highlight its standard error stream.
+
+Free zeroed blocks in files with resparse.
+
+Discard a block device with dbz and check if it will returns zeroes.
+	devname="mmcblkX"
+	devpath="/dev/$devname"
+	sysgran="/sys/block/$devname/queue/discard_granularity"
+	bsz=0
+	[[ -r "$sysgran" ]] && bsz="`< "$sysgran"`"
+	[[ "$bsz" -lt 4096 ]] && bsz=4194304
+	./dbz -d "$devpath"
+	./dbz -q && z=1
+	dd if=/path/to/disk.img bs=$bsz ${z:+conv=sparse} of="$devpath"
+
+Use LD_PRELOAD with libnocache to avoid caching file content in memory, and
+with libmadvmerge to mark identical user memory pages as mergeable for KSM.

@@ -1,5 +1,5 @@
 /*
-	This file is part of stdansi.
+	This file is part of miscutil.
 	Copyright (C) 2016, Robert L. Thompson
 
 	This program is free software: you can redistribute it and/or modify
