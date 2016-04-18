@@ -1,12 +1,14 @@
 Run make to build any or all of the components.  (There is no install target.)
 32-bit sub-architecture and cross compiles are supported.
 
-Run a program with stdansi to highlight its standard error stream.
+Run a program with stdansi to highlight its standard error stream, inspired by
+https://github.com/charliesome/errexec
 
 Free zeroed blocks in files with resparse.
 
 Discard a block device with dbz and check if it will returns zeroes.
-This improves imaging speed especially when zeroed blocks can be skipped.
+This improves imaging speed especially when zeroed blocks can be skipped, as on
+many SD cards and eMMC modules.
 	devname="mmcblkX"
 	devpath="/dev/$devname"
 	sysgran="/sys/block/$devname/queue/discard_granularity"
@@ -15,7 +17,9 @@ This improves imaging speed especially when zeroed blocks can be skipped.
 	[[ "$bsz" -lt 1048576 ]] && bsz=4194304
 	./dbz -d "$devpath"
 	./dbz -q && z=1
-	pv -ptrabfeWB "$bsz" /path/to/disk.img | dd iflag=fullblock bs="$bsz" ${z:+"conv=sparse"} oflag=direct of="$devpath"
+	pv -ptrabfeWB "$bsz" /path/to/disk.img | \
+	dd iflag=fullblock bs="$bsz" ${z:+"conv=sparse"} oflag=direct of="$devpath"
 
 Use LD_PRELOAD with libnocache to avoid caching file content in memory, and
 with libmadvmerge to mark identical user memory pages as mergeable for KSM.
+These are based on https://www.flamingspork.com/projects/libeatmydata/
