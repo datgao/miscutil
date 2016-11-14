@@ -1,11 +1,15 @@
+- Build
 Run make to build any or all of the components.  (There is no install target.)
 32-bit sub-architecture and cross compiles are supported.
 
+- stdansi
 Run a program with stdansi to highlight its standard error stream, inspired by
 https://github.com/charliesome/errexec
 
+- resparse
 Free zeroed blocks in files with resparse.
 
+- dbz
 Discard a block device with dbz and check if it will returns zeroes.
 This improves imaging speed especially when zeroed blocks can be skipped, as on
 many SD cards and eMMC modules.
@@ -20,6 +24,27 @@ many SD cards and eMMC modules.
 	pv -ptrabfeWB "$bsz" /path/to/disk.img | \
 	dd iflag=fullblock bs="$bsz" ${z:+"conv=sparse"} oflag=direct of="$devpath"
 
+- libnocache.so, libmadvmerge.so
 Use LD_PRELOAD with libnocache to avoid caching file content in memory, and
 with libmadvmerge to mark identical user memory pages as mergeable for KSM.
 These are based on https://www.flamingspork.com/projects/libeatmydata/
+
+- sudoers
+Grant root permissions without password for snoozer.sh, throttle_cpu.sh,
+and toggle_backlight.sh.
+
+- blank_display.sh
+Turn off backlight without screensaver.
+
+- snooze.sh and helper snoozer.sh
+Lock session and suspend.  On resume, wait for user to unlock, and sleep
+again on timeout.
+
+- throttle_cpu.sh
+Compromise across CPU performance/power/thermal targets.
+1. Performance: ondemand, online, turbo boost, active - snappy
+2. Battery: powersave, online, no turbo boost, active - tolerable
+3. Fan: powersave, offline, no turbo boost, limit load - beyond slow
+
+- toggle_backlight.sh
+Switch bright/dim display.

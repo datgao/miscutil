@@ -10,7 +10,6 @@ LIBLDFLAGS = $(LDFLAGS) -shared -Wl,--no-as-needed -ldl
 MAKE ?= make
 STRIP ?= strip
 XSTRIP = $(CROSS_COMPILE)$(STRIP)
-CP ?= cp
 RM ?= rm -f
 MEXE = stdansi
 LEXE = dbz resparse
@@ -33,7 +32,7 @@ define static
 stx$(1) = $(patsubst %,%s,$(1))
 $$(stx$(1)): $$(obj$(1))
 	$(XCC) -o $$(stx$(1)) $$(obj$(1)) $(2)
-	$(STRIP) $$(stx$(1))
+	$(XSTRIP) $$(stx$(1))
 endef
 
 define targets
@@ -43,8 +42,7 @@ dbg$(1) = $(patsubst %,%g$(2),$(1))
 stx$(1) = $(if $(5),$(patsubst %,%s,$(1)))
 OBJS += $(1)$(2)
 $(1)$(2): $$(dbg$(1)) $$(stx$(1))
-	$(CP) $$(dbg$(1)) $(1)$(2)
-	$(STRIP) $(1)$(2)
+	$(XSTRIP) -sxo $(1)$(2) $$(dbg$(1))
 OBJS += $$(dbg$(1))
 $$(dbg$(1)): $$(obj$(1))
 	$(XCC) -o $$(dbg$(1)) $$(obj$(1)) $(4)

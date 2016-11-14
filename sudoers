@@ -1,0 +1,1 @@
+ALL     ALL=(ALL:ALL) NOPASSWD: /usr/local/sbin/snoozer.sh, /usr/local/sbin/throttle_cpu.sh, /usr/local/sbin/toggle_backlight.sh

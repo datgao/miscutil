@@ -32,6 +32,14 @@
 #include <string.h>
 #include <stdio.h>
 
+#define AVOID_SPLICE
+
+#ifndef AVOID_SPLICE
+#ifdef SPLICE_F_NONBLOCK
+#define USE_SPLICE
+#endif
+#endif
+
 static bool writeiov(int fd, struct iovec *iov, unsigned niov)
 {
 	bool ret = false;
@@ -62,7 +70,7 @@ fail:
 	return ret;
 }
 
-#ifdef SPLICE_F_NONBLOCK
+#ifdef USE_SPLICE
 static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ansi, size_t size, int fdb)
 {
 	bool ret = false;
@@ -78,7 +86,7 @@ static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ans
 	}
 	if (fdp != NULL) {
 		len = splice(*fdp, NULL, fdb, NULL, 65536, SPLICE_F_NONBLOCK);
-		if (len < 0 && errno != EINTR) {
+		if (len < 0 && errno != EINTR && errno != EAGAIN) {
 			perror("splice()");
 			goto fail;
 		}
