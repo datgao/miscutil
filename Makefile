@@ -1,7 +1,7 @@
 CC ?= gcc
 XCC = $(CROSS_COMPILE)$(CC)
 OLVL ?= s
-CFLAGS ?= -O$(OLVL) -Wall -Wextra -ggdb3 $(COPTS)
+CFLAGS ?= -O$(OLVL) -Wall -Wextra -ggdb3 $(COPT)
 CFLAGS += $(BITNESS)
 LIBCFLAGS = $(CFLAGS) -fPIC
 LDFLAGS += $(BITNESS)

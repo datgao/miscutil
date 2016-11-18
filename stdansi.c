@@ -32,8 +32,6 @@
 #include <string.h>
 #include <stdio.h>
 
-#define AVOID_SPLICE
-
 #ifndef AVOID_SPLICE
 #ifdef SPLICE_F_NONBLOCK
 #define USE_SPLICE

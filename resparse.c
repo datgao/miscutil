@@ -36,7 +36,8 @@
 #define FALLOC_FL_PUNCH_HOLE	0x2
 #endif
 
-static ssize_t readfd(int fd, off_t offt, char *buf, size_t size)
+#if 0
+static ssize_t preadfd(int fd, off_t offt, char *buf, size_t size)
 {
 	size_t len = size;
 	ssize_t rlen;
@@ -47,7 +48,6 @@ static ssize_t readfd(int fd, off_t offt, char *buf, size_t size)
 			if (errno == EINTR)
 				continue;
 			perror("read()");
-			len = -1;
 			goto fail;
 		}
 		if (rlen == 0)
@@ -61,31 +61,66 @@ static ssize_t readfd(int fd, off_t offt, char *buf, size_t size)
 fail:
 	return rlen;
 }
+#endif
+
+static ssize_t readfd(int fd, char *buf, size_t size)
+{
+	size_t len = size;
+	ssize_t rlen;
+
+	do {
+		rlen = read(fd, buf, len);
+		if (rlen < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("read()");
+			goto fail;
+		}
+		if (rlen == 0)
+			break;
+		buf += rlen;
+		len -= rlen;
+	} while (len > 0);
+
+	rlen = size - len;
+fail:
+	return rlen;
+}
 
 static bool punch_hole(int fd, off_t offt, size_t blksz, const char *buf, size_t len)
 {
 	bool ret = false;
-	size_t idx, hole, pos, last;
+	size_t ext, rem, pos;
 
 	pos = 0;
-	last = 0;
 	while (pos < len) {
+		while (pos < len && *buf != '\0') {
+			buf++;
+			pos++;
+		}
+
+		rem = pos % blksz;
+		if (rem != 0)
+			rem = blksz - rem;
+		pos += rem;
+		buf += rem;
+		offt += rem;
+
+		ext = pos;
 		while (pos < len && *buf == '\0') {
 			buf++;
 			pos++;
 		}
-		idx = pos % blksz;
-		pos -= idx;
-		hole = pos - last;
-		if (hole > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offt, hole) != 0) {
+
+		ext = pos - ext;
+		rem = ext % blksz;
+		ext -= rem;
+
+		if (ext > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offt, ext) != 0) {
 			perror("fallocate()");
 			goto fail;
 		}
-		idx = blksz - idx;
-		offt += hole + idx;
-		buf += blksz + idx;
-		pos += blksz;
-		last = pos;
+		offt += ext;
 	}
 	ret = true;
 fail:
@@ -95,57 +130,57 @@ fail:
 static bool resparse(int fd, off_t flen, size_t blksz, char *buf, size_t bufsz)
 {
 	bool ret = false;
-	off_t offt;
-	ssize_t rlen;
+	off_t offt = 0;
+	ssize_t rlen = 0;
 	size_t len;
 
-#if defined(SEEK_DATA) && defined(SEEK_HOLE)
+#if defined(SEEK_DATA) && defined(SEEK_HOLE) && !defined(AVOID_SEEK_HOLE)
 	off_t hole, data;
 
-	offt = 0;
 	do {
 		data = lseek(fd, offt, SEEK_DATA);
-		hole = lseek(fd, data, SEEK_HOLE);
-		if (data < 0 || hole < 0) {
-			perror("lseek()");
+		if (data < 0) {
+			perror("lseek(SEEK_DATA)");
 			goto fail;
 		}
-		if (data > flen)
+		hole = lseek(fd, data, SEEK_HOLE);
+		if (hole < 0) {
+			perror("lseek(SEEK_HOLE)");
+			goto fail;
+		}
+		if (data >= flen)
 			break;
-		offt = data;
-		while (offt < hole) {
-			len = hole - offt;
-			if (len > bufsz)
-				len = bufsz;
-			rlen = readfd(fd, offt, buf, len);
+		offt = lseek(fd, data, SEEK_SET);
+		if (offt < 0) {
+			perror("lseek(SEEK_SET)");
+			goto fail;
+		}
+		if (offt != data)
+			break;
+		len = hole - offt;
+		while (len > 0) {
+			rlen = readfd(fd, buf, (len < bufsz) ? len : bufsz);
 			if (rlen < 0)
 				goto fail;
-			if (rlen == 0)
-				goto success;
-			len = rlen;
-			if (!punch_hole(fd, offt, blksz, buf, len))
+			if (rlen > 0 && !punch_hole(fd, offt, blksz, buf, rlen))
 				goto fail;
-			offt += len;
+			offt += rlen;
+			len -= rlen;
 		}
-	} while (hole < flen);
+	} while ((size_t)rlen == bufsz && hole < flen);
 #else
-	offt = 0;
 	do {
-		rlen = readfd(fd, offt, buf, bufsz);
+		rlen = readfd(fd, buf, bufsz);
 		if (rlen < 0)
 			goto fail;
 		len = (size_t)rlen % blksz;
 		rlen -= len;
-		if (rlen == 0)
-			goto success;
-		len = rlen;
-		if (!punch_hole(fd, offt, blksz, buf, len))
+		if (rlen > 0 && !punch_hole(fd, offt, blksz, buf, rlen))
 			goto fail;
-		offt += len;
-	} while (offt < flen);
+		offt += rlen + len;
+	} while (rlen == bufsz && offt < flen);
 #endif
 
-success:
 	ret = true;
 fail:
 	return ret;
@@ -157,7 +192,7 @@ int main(int argc, char **argv)
 	struct stat st;
 	off_t flen;
 	blksize_t blksz;
-	size_t bufsz;
+	size_t bufsz = 65536;
 	char *buf = NULL;
 
 	if (argc != 2) {
@@ -190,7 +225,6 @@ int main(int argc, char **argv)
 	if (flen == 0)
 		goto success;
 
-	bufsz = 65536;
 	if (bufsz < (size_t)blksz) {
 		bufsz = blksz;
 	} else {
