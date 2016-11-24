@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -68,6 +69,12 @@ static int (*libc_open)(const char *, int, ...) = NULL;
 #endif
 static ssize_t (*libc_read)(int, void *, size_t) = NULL;
 static ssize_t (*libc_write)(int, const void *, size_t) = NULL;
+static ssize_t (*libc_pread)(int, void *, size_t, off_t) = NULL;
+static ssize_t (*libc_pwrite)(int, const void *, size_t, off_t) = NULL;
+static ssize_t (*libc_readv)(int, const struct iovec *, int) = NULL;
+static ssize_t (*libc_writev)(int, const struct iovec *, int) = NULL;
+static ssize_t (*libc_preadv)(int, const struct iovec *, int, off_t) = NULL;
+static ssize_t (*libc_pwritev)(int, const struct iovec *, int, off_t) = NULL;
 static int (*libc_fsync)(int) = NULL;
 #if _POSIX_SYNCHRONIZED_IO > 0
 static int (*libc_fdatasync)(int) = NULL;
@@ -85,6 +92,12 @@ void __attribute__((constructor)) madvmerge_init(void)
 #endif
 	ASSIGN_DLSYM_IF_EXIST(read)
 	ASSIGN_DLSYM_IF_EXIST(write)
+	ASSIGN_DLSYM_IF_EXIST(pread)
+	ASSIGN_DLSYM_IF_EXIST(pwrite)
+	ASSIGN_DLSYM_IF_EXIST(readv)
+	ASSIGN_DLSYM_IF_EXIST(writev)
+	ASSIGN_DLSYM_IF_EXIST(preadv)
+	ASSIGN_DLSYM_IF_EXIST(pwritev)
 	ASSIGN_DLSYM_IF_EXIST(fsync)
 #if _POSIX_SYNCHRONIZED_IO > 0
 	ASSIGN_DLSYM_IF_EXIST(fdatasync)
@@ -115,6 +128,72 @@ ssize_t write(int fd, const void *buf, size_t count)
 	ret = libc_write(fd, buf, count);
 	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
 		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside write()")
+	return ret;
+}
+
+ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+{
+	ssize_t ret;
+
+	COND_ASSIGN_DLSYM_OR_DIE(pread)
+	ret = libc_pread(fd, buf, count, offset);
+	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pread()")
+	return ret;
+}
+
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
+{
+	ssize_t ret;
+
+	COND_ASSIGN_DLSYM_OR_DIE(pwrite)
+	ret = libc_pwrite(fd, buf, count, offset);
+	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()")
+	return ret;
+}
+
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
+{
+	ssize_t ret;
+
+	COND_ASSIGN_DLSYM_OR_DIE(readv)
+	ret = libc_readv(fd, iov, iovcnt);
+	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pread()")
+	return ret;
+}
+
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
+{
+	ssize_t ret;
+
+	COND_ASSIGN_DLSYM_OR_DIE(writev)
+	ret = libc_writev(fd, iov, iovcnt);
+	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()")
+	return ret;
+}
+
+ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+	ssize_t ret;
+
+	COND_ASSIGN_DLSYM_OR_DIE(preadv)
+	ret = libc_preadv(fd, iov, iovcnt, offset);
+	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pread()")
+	return ret;
+}
+
+ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+	ssize_t ret;
+
+	COND_ASSIGN_DLSYM_OR_DIE(pwritev)
+	ret = libc_pwritev(fd, iov, iovcnt, offset);
+	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()")
 	return ret;
 }
 

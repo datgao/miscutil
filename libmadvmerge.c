@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE
 #include <sys/mman.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -45,6 +46,7 @@ static void *(*libc_realloc)(void *, size_t) = NULL;
 static int (*libc_brk)() = NULL;
 static void *(*libc_sbrk)(intptr_t) = NULL;
 static void *(*libc_mmap)(void *, size_t, int, int, int, off_t) = NULL;
+static void *(*libc_mremap)(void *, size_t, size_t, int flags, ...) = NULL;
 #if 0
 static void *(*libc_calloc)(size_t, size_t) = NULL;
 #endif
@@ -78,6 +80,7 @@ void __attribute__((constructor)) madvmerge_init()
 	ASSIGN_DLSYM_IF_EXIST(brk)
 	ASSIGN_DLSYM_IF_EXIST(sbrk)
 	ASSIGN_DLSYM_IF_EXIST(mmap)
+	ASSIGN_DLSYM_IF_EXIST(mremap)
 #if 0
 	ASSIGN_DLSYM_IF_EXIST(calloc)
 #endif
@@ -167,6 +170,25 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offs)
 	ptr = libc_mmap(addr, len, prot, flags, fd, offs);
 	if (ptr != MAP_FAILED)
 		madvmerge_madvise_mergeable(ptr, len);
+	return ptr;
+}
+
+void *mremap(void *oldaddr, size_t oldsize, size_t newsize, int flags, ...)
+{
+	va_list ap;
+	void *ptr, *newaddr;
+
+	va_start(ap, flags);
+	COND_ASSIGN_DLSYM_OR_DIE(mremap);
+	if ((flags & MREMAP_MAYMOVE) == 0) {
+		ptr = libc_mremap(oldaddr, oldsize, newsize, flags);
+	} else {
+		newaddr = va_arg(ap, void *);
+		ptr = libc_mremap(oldaddr, oldsize, newsize, flags, newaddr);
+	}
+	if (ptr != MAP_FAILED)
+		madvmerge_madvise_mergeable(ptr, newsize);
+	va_end(ap);
 	return ptr;
 }
 

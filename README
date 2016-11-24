@@ -24,10 +24,14 @@ many SD cards and eMMC modules.
 	pv -ptrabfeWB "$bsz" /path/to/disk.img | \
 	dd iflag=fullblock bs="$bsz" ${z:+"conv=sparse"} oflag=direct of="$devpath"
 
-- libnocache.so, libmadvmerge.so
-Use LD_PRELOAD with libnocache to avoid caching file content in memory, and
-with libmadvmerge to mark identical user memory pages as mergeable for KSM.
-These are based on https://www.flamingspork.com/projects/libeatmydata/
+- ksm.sh, madvmerge.sh, libmadvmerge.so
+Hook memory allocation library calls to mark identical user memory pages
+as mergeable, toggle kernel same page merging state, and check stats.
+
+- nocache.sh, libnocache.so
+Avoid caching file content in memory.
+Both libmadvmerge.so and libnocache.so are based on
+https://www.flamingspork.com/projects/libeatmydata/
 
 - sudoers
 Grant root permissions without password for snoozer.sh, throttle_cpu.sh,
@@ -48,3 +52,6 @@ Compromise across CPU performance/power/thermal targets.
 
 - toggle_backlight.sh
 Switch bright/dim display.
+
+- zramoff.sh
+Empty zram swap and restart zram-config service.

@@ -32,12 +32,6 @@
 #include <string.h>
 #include <stdio.h>
 
-#ifndef AVOID_SPLICE
-#ifdef SPLICE_F_NONBLOCK
-#define USE_SPLICE
-#endif
-#endif
-
 static bool writeiov(int fd, struct iovec *iov, unsigned niov)
 {
 	bool ret = false;
@@ -68,7 +62,7 @@ fail:
 	return ret;
 }
 
-#ifdef USE_SPLICE
+#if defined(SPLICE_F_NONBLOCK) && !defined(AVOID_SPLICE)
 static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ansi, size_t size, int fdb)
 {
 	bool ret = false;
