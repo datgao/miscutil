@@ -92,9 +92,9 @@ static bool punch_hole(int fd, off_t offt, size_t blksz, const char *buf, size_t
 	bool ret = false;
 	size_t ext, rem, pos;
 
-	pos = 0;
-	while (pos < len) {
-		while (pos < len && *buf != '\0') {
+	pos = offt;
+	while (pos < offt + len) {
+		while (pos < offt + len && *buf != '\0') {
 			buf++;
 			pos++;
 		}
@@ -104,23 +104,28 @@ static bool punch_hole(int fd, off_t offt, size_t blksz, const char *buf, size_t
 			rem = blksz - rem;
 		pos += rem;
 		buf += rem;
-		offt += rem;
 
 		ext = pos;
-		while (pos < len && *buf == '\0') {
+		while (pos < offt + len && *buf == '\0') {
 			buf++;
 			pos++;
 		}
 
 		ext = pos - ext;
+		pos -= ext;
 		rem = ext % blksz;
 		ext -= rem;
 
-		if (ext > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offt, ext) != 0) {
+		if (ext > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pos, ext) != 0) {
 			perror("fallocate()");
 			goto fail;
 		}
-		offt += ext;
+
+		pos += rem + ext;
+		if (rem != 0)
+			rem = blksz - rem;
+		pos += rem;
+		buf += rem;
 	}
 	ret = true;
 fail:
@@ -132,7 +137,7 @@ static bool resparse(int fd, off_t flen, size_t blksz, char *buf, size_t bufsz)
 	bool ret = false;
 	off_t offt = 0;
 	ssize_t rlen = 0;
-	size_t len;
+	size_t len, span = 0;
 
 #if defined(SEEK_DATA) && defined(SEEK_HOLE) && !defined(AVOID_SEEK_HOLE)
 	off_t hole, data;
@@ -140,11 +145,15 @@ static bool resparse(int fd, off_t flen, size_t blksz, char *buf, size_t bufsz)
 	do {
 		data = lseek(fd, offt, SEEK_DATA);
 		if (data < 0) {
+			if (errno == ENXIO)
+				break;
 			perror("lseek(SEEK_DATA)");
 			goto fail;
 		}
 		hole = lseek(fd, data, SEEK_HOLE);
 		if (hole < 0) {
+			if (errno == ENXIO)
+				break;
 			perror("lseek(SEEK_HOLE)");
 			goto fail;
 		}
@@ -159,7 +168,8 @@ static bool resparse(int fd, off_t flen, size_t blksz, char *buf, size_t bufsz)
 			break;
 		len = hole - offt;
 		while (len > 0) {
-			rlen = readfd(fd, buf, (len < bufsz) ? len : bufsz);
+			span = (len < bufsz) ? len : bufsz;
+			rlen = readfd(fd, buf, span);
 			if (rlen < 0)
 				goto fail;
 			if (rlen > 0 && !punch_hole(fd, offt, blksz, buf, rlen))
@@ -167,7 +177,7 @@ static bool resparse(int fd, off_t flen, size_t blksz, char *buf, size_t bufsz)
 			offt += rlen;
 			len -= rlen;
 		}
-	} while ((size_t)rlen == bufsz && hole < flen);
+	} while ((size_t)rlen == span && hole < flen);
 #else
 	do {
 		rlen = readfd(fd, buf, bufsz);
