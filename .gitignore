@@ -1,0 +1,8 @@
+*.o
+*.so
+asm*
+dbz*
+fat32*
+resparse*
+stdansi*
+!*.c

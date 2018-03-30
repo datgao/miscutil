@@ -1,6 +1,6 @@
 /*
 	This file is part of miscutil.
-	Copyright (C) 2015-2016, Robert L. Thompson
+	Copyright (C) 2015-2018, Robert L. Thompson
 
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -48,11 +48,13 @@ static bool dbz(const char *devpath, const char *fname, bool query)
 {
 	bool ret = false;
 	int fd = -1, fdr = -1;
-	unsigned does_zero, blksz, blk, i;
+	unsigned does_zero, blksz, blk, i, flags = O_RDWR;
 	uint64_t range[2];
 	struct stat stdev, stfile;
 
-	fd = open(devpath, O_RDWR);
+	if (!query && fname == NULL)
+		flags |= O_EXCL;
+	fd = open(devpath, flags);
 	if (fd < 0) {
 		perror("open(devnode)");
 		goto fail;
@@ -124,7 +126,7 @@ static bool dbz(const char *devpath, const char *fname, bool query)
 		} else {
 			range[0] = 0;
 			if (ioctl(fd, BLKGETSIZE64, &range[1]) != 0) {
-				perror("ioctl(BLKGETSZ64)");
+				perror("ioctl(BLKGETSIZE64)");
 				goto fail;
 			}
 			if (!dbz_discard(fd, range))

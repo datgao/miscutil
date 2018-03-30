@@ -1,6 +1,6 @@
 /*
 	This file is part of miscutil.
-	Copyright (C) 2012-2016, Robert L. Thompson
+	Copyright (C) 2012-2018, Robert L. Thompson
 
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -87,10 +87,10 @@ fail:
 	return rlen;
 }
 
-static bool punch_hole(int fd, off_t offt, size_t blksz, const char *buf, size_t len)
+static bool punch_hole(int fd, off_t offt, size_t blksz, const char *buf, off_t len)
 {
 	bool ret = false;
-	size_t ext, rem, pos;
+	off_t ext, rem, pos;
 
 	pos = offt;
 	while (pos < offt + len) {
@@ -116,10 +116,14 @@ static bool punch_hole(int fd, off_t offt, size_t blksz, const char *buf, size_t
 		rem = ext % blksz;
 		ext -= rem;
 
+#ifdef PUNCH_DEBUG
+		if (ext > 0) printf("%llx\t%llx\n", (unsigned long long)pos, (unsigned long long)ext);
+#else
 		if (ext > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pos, ext) != 0) {
 			perror("fallocate()");
 			goto fail;
 		}
+#endif
 
 		pos += rem + ext;
 		if (rem != 0)
@@ -135,9 +139,7 @@ fail:
 static bool resparse(int fd, off_t flen, size_t blksz, char *buf, size_t bufsz)
 {
 	bool ret = false;
-	off_t offt = 0;
-	ssize_t rlen = 0;
-	size_t len, span = 0;
+	off_t len, span = 0, offt = 0, rlen = 0;
 
 #if defined(SEEK_DATA) && defined(SEEK_HOLE) && !defined(AVOID_SEEK_HOLE)
 	off_t hole, data;
@@ -168,7 +170,7 @@ static bool resparse(int fd, off_t flen, size_t blksz, char *buf, size_t bufsz)
 			break;
 		len = hole - offt;
 		while (len > 0) {
-			span = (len < bufsz) ? len : bufsz;
+			span = (len < (off_t)bufsz) ? len : (off_t)bufsz;
 			rlen = readfd(fd, buf, span);
 			if (rlen < 0)
 				goto fail;
@@ -177,13 +179,13 @@ static bool resparse(int fd, off_t flen, size_t blksz, char *buf, size_t bufsz)
 			offt += rlen;
 			len -= rlen;
 		}
-	} while ((size_t)rlen == span && hole < flen);
+	} while (rlen == span && hole < flen);
 #else
 	do {
 		rlen = readfd(fd, buf, bufsz);
 		if (rlen < 0)
 			goto fail;
-		len = (size_t)rlen % blksz;
+		len = rlen % blksz;
 		rlen -= len;
 		if (rlen > 0 && !punch_hole(fd, offt, blksz, buf, rlen))
 			goto fail;
@@ -198,7 +200,7 @@ fail:
 
 int main(int argc, char **argv)
 {
-	int ret = EXIT_FAILURE, fd = -1;
+	int ret = EXIT_FAILURE, fd = -1, flags = O_RDWR;
 	struct stat st;
 	off_t flen;
 	blksize_t blksz;
@@ -210,7 +212,11 @@ int main(int argc, char **argv)
 		goto fail;
 	}
 
-	fd = open(argv[1], O_RDWR);
+#ifdef PUNCH_DEBUG
+	flags = O_RDONLY;
+#endif
+
+	fd = open(argv[1], flags);
 	if (fd < 0) {
 		perror("open()");
 		goto fail;

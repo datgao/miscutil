@@ -1,6 +1,6 @@
 /*
 	This file is part of miscutil.
-	Copyright (C) 2016, Robert L. Thompson
+	Copyright (C) 2016-2018, Robert L. Thompson
 
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -62,7 +62,8 @@ fail:
 	return ret;
 }
 
-#if defined(SPLICE_F_NONBLOCK) && !defined(AVOID_SPLICE)
+//#if defined(SPLICE_F_NONBLOCK) && !defined(AVOID_SPLICE)
+#if 0
 static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ansi, size_t size, int fdb)
 {
 	bool ret = false;
@@ -78,7 +79,7 @@ static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ans
 	}
 	if (fdp != NULL) {
 		len = splice(*fdp, NULL, fdb, NULL, 65536, SPLICE_F_NONBLOCK);
-		if (len < 0 && errno != EINTR && errno != EAGAIN) {
+		if (len < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
 			perror("splice()");
 			goto fail;
 		}
@@ -92,22 +93,22 @@ static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ans
 fail:
 	return ret;
 }
-#else
-static size_t readfd(int *fdp, char *buf, size_t size)
+#endif
+//#else
+static ssize_t readfd(int *fdp, char *buf, size_t size)
 {
-	size_t ret = 0;
-	ssize_t len;
-	int fd = *fdp;
+	ssize_t len, ret = 0;
 
-	len = read(fd, buf, size);
+	len = read(*fdp, buf, size);
 	if (len < 0) {
-		if (errno == EINTR)
+		if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
 			goto out;
 		perror("read()");
+		ret = len;
 		goto out;
 	}
 	if (len == 0) {
-		close(fd);
+		close(*fdp);
 		*fdp = -1;
 		goto out;
 	}
@@ -116,11 +117,11 @@ static size_t readfd(int *fdp, char *buf, size_t size)
 out:
 	return ret;
 }
-
+#if 0
 static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ansi, size_t size, int fdb)
 {
 	bool ret = false;
-	size_t len = 0;
+	ssize_t len = 0;
 	char buf[4096];
 	struct iovec iov[2];
 	unsigned niov = 0;
@@ -138,6 +139,8 @@ static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ans
 	}
 	if (fdp != NULL) {
 		len = readfd(fdp, buf, sizeof buf);
+		if (len < 0)
+			goto fail;
 		if (len > 0) {
 			iov[niov].iov_base = (void *)buf;
 			iov[niov].iov_len = len;
@@ -153,7 +156,69 @@ fail:
 }
 #endif
 
-static bool writecolor(int *fdp, const char *code, bool *is_on, bool want, int fda, int fdb)
+static bool writeansi(int *fdp, bool *is_on, bool want, int fda, const char *ansi, size_t size, int fdb, bool *try_splice)
+{
+	bool ret = false;
+	ssize_t len = 0;
+	char buf[4096];
+	struct iovec iov[2];
+	unsigned niov = 0;
+
+	if (*is_on != want) {
+		*is_on = want;
+		iov[niov].iov_base = (void *)ansi;
+		iov[niov].iov_len = size;
+		niov++;
+	}
+	if (fdp != NULL) {
+#if defined(SPLICE_F_NONBLOCK) && !defined(AVOID_SPLICE)
+		if (fdb < 0)
+			*try_splice = false;
+		if (*try_splice) {
+			if (niov != 0 && !writeiov(fda, iov, niov))
+				goto fail;
+			niov = 0;
+			len = splice(*fdp, NULL, fdb, NULL, 65536, SPLICE_F_NONBLOCK);
+			if (len == 0) {
+				close(*fdp);
+				*fdp = -1;
+			}
+			if (len < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+				//perror("splice()\x07");
+				*try_splice = false;	// fdb has O_APPEND - GNU screen?
+			}
+		}
+#else
+		*try_splice = false;
+#endif
+		if (!*try_splice) {
+			if (niov != 0 && fda != fdb) {
+				if (!writeiov(fda, iov, niov))
+					goto fail;
+				niov = 0;
+			}
+			len = readfd(fdp, buf, sizeof buf);
+			if (len < 0)
+				goto fail;
+			if (len > 0) {
+				iov[niov].iov_base = (void *)buf;
+				iov[niov].iov_len = len;
+				niov++;
+			}
+		}
+#if defined(SPLICE_F_NONBLOCK) && !defined(AVOID_SPLICE)
+		//*try_splice = true;
+#endif
+	}
+	if (fdb >= 0 && niov > 0 && !writeiov(fdb, iov, niov))
+		goto fail;
+
+	ret = true;
+fail:
+	return ret;
+}
+
+static bool writecolor(int *fdp, const char *code, bool *is_on, bool want, int fda, int fdb, bool *try_splice)
 {
 	bool ret = false;
 	char highlight[8];
@@ -162,7 +227,7 @@ static bool writecolor(int *fdp, const char *code, bool *is_on, bool want, int f
 	size_t pick = want ? sizeof highlight : sizeof restore;
 
 	snprintf(highlight, sizeof highlight, "\x1b[%s;1m", code);
-	if (!writeansi(fdp, is_on, want, fda, ansi, pick - 1, fdb))
+	if (!writeansi(fdp, is_on, want, fda, ansi, pick - 1, fdb, try_splice))
 		goto fail;
 
 	ret = true;
@@ -189,7 +254,7 @@ enum {
 	PIPEOPS
 };
 
-static bool writestuff(int fdpipe[PIPENUM][PIPEOPS], fd_set *fdset, const char *code, bool *is_on, const int fdstd[STDNUM])
+static bool writestuff(int fdpipe[PIPENUM][PIPEOPS], fd_set *fdset, const char *code, bool *is_on, const int fdstd[STDNUM], bool *try_splice)
 {
 	bool ret, state;
 	unsigned i;
@@ -205,7 +270,7 @@ static bool writestuff(int fdpipe[PIPENUM][PIPEOPS], fd_set *fdset, const char *
 		}
 		if (fdp != NULL && (*fdp < 0 || !FD_ISSET(*fdp, fdset)))
 			fdp = NULL;
-		ret = writecolor(fdp, code, is_on, state, fdstd[STDERR], fdb);
+		ret = writecolor(fdp, code, is_on, state, fdstd[STDERR], fdb, try_splice);
 	}
 
 	return ret;
@@ -267,10 +332,33 @@ enum ansi_color {
 
 #define ARRAY_LEN(a)	(sizeof(a)/sizeof(*(a)))
 
+static bool fd_nonblock(int fd, bool nonblock)
+{
+	bool ret = false;
+	int flags, mask = O_NONBLOCK, bit = nonblock ? mask : 0;
+
+	flags = fcntl(fd, F_GETFL);
+	if (flags < 0) {
+		perror("fcntl(F_GETFL)");
+		goto fail;
+	}
+
+	flags ^= mask;
+
+	if ((flags & mask) == bit && fcntl(fd, F_SETFL, flags) != 0) {
+		perror("fcntl(F_SETFL)");
+		goto fail;
+	}
+
+	ret = true;
+fail:
+	return ret;
+}
+
 static bool color_output(int fdpipe[PIPENUM][PIPEOPS], const int fdstd[STDNUM], const char *name)
 {
-	bool ret = false, is_on = false;
-	int nfds = -1;
+	bool ret = false, is_on = false, try_splice = true;
+	int fd, i, nfds = -1;
 	fd_set fdset;
 	char code[3];
 	const char *ptr, **pstr;
@@ -281,9 +369,21 @@ static bool color_output(int fdpipe[PIPENUM][PIPEOPS], const int fdstd[STDNUM], 
 						[COLOR_CYAN] = "cyan", [COLOR_WHITE] = "white" };
 	enum ansi_color entries = ARRAY_LEN(palette), color = entries;
 
-	close(fdstd[STDIN]);
-	close(fdpipe[PIPEOUT][PIPEWR]);
-	close(fdpipe[PIPEERR][PIPEWR]);
+	for (i = 0; i < STDNUM; i++) {
+		fd = fdstd[i];
+		if (i == STDIN) {
+			close(fd);
+			continue;
+		}
+		if (!fd_nonblock(fd, false))
+			goto fail;
+	}
+
+	for (i = 0; i < PIPENUM; i++) {
+		if (!fd_nonblock(fdpipe[i][PIPERD], true))
+			goto fail;
+		close(fdpipe[i][PIPEWR]);
+	}
 
 	if (name != NULL) {
 		namelen = strlen(name);
@@ -311,13 +411,13 @@ static bool color_output(int fdpipe[PIPENUM][PIPEOPS], const int fdstd[STDNUM], 
 		}
 		if (nfds == 0)
 			continue;
-		if (!writestuff(fdpipe, &fdset, code, &is_on, fdstd))
+		if (!writestuff(fdpipe, &fdset, code, &is_on, fdstd, &try_splice))
 			goto fail;
 	}
 
 	ret = true;
 fail:
-	if (!writecolor(NULL, code, &is_on, false, fdstd[STDERR], -1))
+	if (!writecolor(NULL, code, &is_on, false, fdstd[STDERR], -1, &try_splice))
 		ret = EXIT_FAILURE;
 	return ret;
 }

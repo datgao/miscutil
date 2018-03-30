@@ -1,10 +1,10 @@
 CC ?= gcc
 XCC = $(CROSS_COMPILE)$(CC)
-OLVL ?= s
+OLVL ?= 3
 CFLAGS ?= -O$(OLVL) -Wall -Wextra -ggdb3 $(COPT)
 CFLAGS += $(BITNESS)
 LIBCFLAGS = $(CFLAGS) -fPIC
-LDFLAGS += $(BITNESS)
+LDFLAGS += $(BITNESS) -lrt
 LDSTATIC = $(LDFLAGS) -static
 LIBLDFLAGS = $(LDFLAGS) -shared -Wl,--no-as-needed -ldl
 MAKE ?= make
@@ -12,7 +12,7 @@ STRIP ?= strip
 XSTRIP = $(CROSS_COMPILE)$(STRIP)
 RM ?= rm -f
 MEXE = stdansi
-LEXE = dbz resparse
+LEXE = asm dbz fat32 resparse
 LLIB = madvmerge nocache
 LIBX = .so
 LBAS = $(patsubst %,lib%,$(LLIB))
@@ -41,12 +41,12 @@ obj$(1) = $(patsubst %,%.o,$(1))
 dbg$(1) = $(patsubst %,%g$(2),$(1))
 stx$(1) = $(if $(5),$(patsubst %,%s,$(1)))
 OBJS += $(1)$(2)
-$(1)$(2): $$(dbg$(1)) $$(stx$(1))
+$(1)$(2): $$(dbg$(1)) # $$(stx$(1))
 	$(XSTRIP) -sxo $(1)$(2) $$(dbg$(1))
 OBJS += $$(dbg$(1))
 $$(dbg$(1)): $$(obj$(1))
 	$(XCC) -o $$(dbg$(1)) $$(obj$(1)) $(4)
-OBJS += $$(stx$(1))
+# OBJS += $$(stx$(1))
 $(if $(5),$(eval $(call static,$(1),$(5))))
 OBJS += $$(obj$(1))
 $$(obj$(1)): $$(src$(1))
