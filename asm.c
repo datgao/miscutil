@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <ucontext.h>
 #include <signal.h>
+#include <setjmp.h>
 #include <time.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -68,24 +69,44 @@
 # warning	"Will use sysconf(_SC_PAGESIZE)."
 #endif
 
+enum asm_pg { ASM_PG_RW_INSN, ASM_PG_XR_INSN, ASM_PG_NONE_GUARD, ASM_PG_NONE_STACK, ASM_PGS };
+
+#define ASM_OFFT_RW_INSN	(ASM_PG_RW_INSN * ASM_PAGE_SIZE)
+#define ASM_OFFT_RW_INSN_END	(ASM_OFFT_RW_INSN + ASM_PAGE_SIZE)
+#define ASM_OFFT_XR_INSN	(ASM_PG_XR_INSN * ASM_PAGE_SIZE)
+#define ASM_OFFT_XR_INSN_END	(ASM_OFFT_XR_INSN + ASM_PAGE_SIZE)
+#define ASM_OFFT_NONE_GUARD	(ASM_PG_NONE_GUARD * ASM_PAGE_SIZE)
+#define ASM_OFFT_NONE_GUARD_END	(ASM_OFFT_NONE_GUARD + ASM_PAGE_SIZE)
+#define ASM_OFFT_NONE_STACK	(ASM_PG_NONE_STACK * ASM_PAGE_SIZE)
+#define ASM_OFFT_NONE_STACK_END	(ASM_OFFT_NONE_STACK + ASM_PAGE_SIZE)
+#define ASM_OFFT_LEN		(ASM_PGS * ASM_PAGE_SIZE)
+
+#define ASM_PTR_BASE		((uint8_t *)ctx.pgspan)
+#define ASM_PTR_BASE_CONST	((const uint8_t *)ctx.pgspan)
+#define ASM_PTR_RW_INSN		(ASM_PTR_BASE + ASM_OFFT_RW_INSN)
+#define ASM_PTR_RW_INSN_END	(ASM_PTR_BASE + ASM_OFFT_RW_INSN_END)
+#define ASM_PTR_RW_INSN_CONST	(ASM_PTR_BASE_CONST + ASM_OFFT_RW_INSN)
+#define ASM_PTR_RW_INSN_END_CONST	(ASM_PTR_BASE_CONST + ASM_OFFT_RW_INSN_END)
+#define ASM_PTR_XR_INSN		(ASM_PTR_BASE + ASM_OFFT_XR_INSN)
+#define ASM_PTR_XR_INSN_END	(ASM_PTR_BASE + ASM_OFFT_XR_INSN_END)
+#define ASM_PTR_XR_INSN_CONST	(ASM_PTR_BASE_CONST + ASM_OFFT_XR_INSN)
+#define ASM_PTR_XR_INSN_END_CONST	(ASM_PTR_BASE_CONST + ASM_OFFT_XR_INSN_END)
+#define ASM_PTR_NONE_GUARD	(ASM_PTR_BASE + ASM_OFFT_NONE_GUARD)
+#define ASM_PTR_NONE_GUARD_END	(ASM_PTR_BASE + ASM_OFFT_NONE_GUARD_END)
+#define ASM_PTR_NONE_STACK	(ASM_PTR_BASE + ASM_OFFT_NONE_STACK)
+#define ASM_PTR_NONE_STACK_END	(ASM_PTR_BASE + ASM_OFFT_NONE_STACK_END)
+
 typedef void sigaction_fn(int, siginfo_t *, void *);
 
-enum asm_sig {
-	ASM_SIG_BUS,
-	ASM_SIG_FPE,
-	ASM_SIG_ILL,
-	ASM_SIG_SEGV,
-	ASM_SIG_TRAP,
-	ASM_SIGS
-};
+enum asm_sig { ASM_SIG_BUS, ASM_SIG_FPE, ASM_SIG_ILL, ASM_SIG_SEGV, ASM_SIG_TRAP, ASM_SIGS };
 
 struct asm_sig_ctx {
-	int signum;
-	sigaction_fn *sigfn;
+	int		signum;
+	sigaction_fn	*sigfn;
 };
 
 struct asm_ctx {
-	struct asm_sig_ctx sigctx[ASM_SIGS];
+	struct asm_sig_ctx	sigctx[ASM_SIGS];
 
 	void		*altstack;
 	size_t		altsz;
@@ -110,6 +131,11 @@ struct asm_ctx {
 
 	gregset_t	gregs;
 	stack_t		stack;
+
+	jmp_buf		jmpenv;
+	bool		jmpvalid;
+
+	bool		nested;
 };
 
 static void sigfn_bus(int signum, siginfo_t *siginfo, void *puctx);
@@ -144,12 +170,15 @@ static struct asm_ctx ctx = {	// init
 	.es_rsm = 0,
 	.fs_rsm = 0,
 	.gs_rsm = 0,
+
+	.jmpvalid = false,
+	.nested = false,
 };
 
 static void asm_insn_print()
 {
 	unsigned i;
-	const uint8_t *pfirst = (const uint8_t *)ctx.pgspan + ASM_PAGE_SIZE - ctx.insnlen;
+	const uint8_t *pfirst = ASM_PTR_RW_INSN_END_CONST - ctx.insnlen;
 
 	for (i = 0; i < ctx.insnlen; i++)
 		printf(" %02"PRIx8, *pfirst++);
@@ -183,13 +212,14 @@ bad:
 
 static void asm_insn_inc(int signum, const siginfo_t *siginfo, ucontext_t *uctx)
 {
-	uint8_t *ptr = NULL, *pend = (uint8_t *)ctx.pgspan + ASM_PAGE_SIZE, *plast = pend - 1, *pterm = plast, *pfirst = plast + 1 - ctx.insnlen;
-	const void *pxend = (const void *)pend + ASM_PAGE_SIZE;
+	uint8_t *ptr = NULL, *pend = ASM_PTR_RW_INSN_END, *plast = pend - 1, *pterm = plast, *pfirst = plast + 1 - ctx.insnlen;
+	const void *const pxend = (const void *)ASM_PTR_XR_INSN_END_CONST;//pend + ASM_OFFT_XR_INSN_END - ASM_OFFT_RW_INSN_END;
 	unsigned span;
 
 	if (ctx.depth && signum == SIGTRAP && siginfo->si_code == TRAP_TRACE) {
 		if (siginfo->si_addr != pxend) {
-			if (siginfo->si_addr < pxend + 127 + ctx.insnlen && siginfo->si_addr >= pxend - 128 + ctx.insnlen) {
+			if (siginfo->si_addr < pxend + 127 + ctx.insnlen
+			&& siginfo->si_addr >= pxend - 128 + ctx.insnlen) {
 				span = 0;
 				if (pxend > siginfo->si_addr)
 					span = pxend - siginfo->si_addr;
@@ -206,30 +236,30 @@ again:
 	if (ctx.depth) {
 		for (ptr = plast ; ptr >= pfirst; ptr--) {
 			if ((*ptr)++ < 0xff) {
-				goto out;
+				goto resume;
 			}
 		}
 	} else {
 		// 0x00-0xff then 0x00-0xff:0x00 - 0x00-0xff:0xff i.e. increment as little-endian
 		for (ptr = pfirst; ptr <= plast; ptr++) {
 			if ((*ptr)++ < 0xff) {
-				goto out;
+				goto resume;
 			}
 		}
 	}
 
 	*(--pfirst) = 0x00;
 	if (ctx.insnlen++ >= ctx.maxlen)
-		goto main;
+		goto finish;
 
-out:
+resume:
 	plast = pterm;
 	if (asm_bad(ctx.insnlen, pfirst, pterm))
 		goto again;
 	memcpy(uctx->uc_mcontext.gregs, ctx.gregs, sizeof ctx.gregs);
 	memcpy(&uctx->uc_stack, &ctx.stack, sizeof ctx.stack);
-	uctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)(ctx.pgspan + 2 * ASM_PAGE_SIZE - ctx.insnlen);
-	uctx->uc_mcontext.gregs[REG_RSP] = (uintptr_t)(ctx.pgspan + 3 * ASM_PAGE_SIZE);
+	uctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)(pxend - ctx.insnlen);
+	uctx->uc_mcontext.gregs[REG_RSP] = (uintptr_t)ASM_PTR_NONE_STACK;
 	asm volatile (
 		"mov $0, %%ax\n"
 		"mov %%ax, %%ds\n"
@@ -239,33 +269,43 @@ out:
 		:
 		:
 		: "rax");
-	return;
+	goto out;
 
-main:
+finish:
 	memcpy(uctx->uc_mcontext.gregs, ctx.gregs_rsm, sizeof ctx.gregs_rsm);
 	memcpy(&uctx->uc_stack, &ctx.stack_rsm, sizeof ctx.stack_rsm);
 	uctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)ctx.rip_rsm;
 	uctx->uc_mcontext.gregs[REG_RSP] = (uintptr_t)ctx.rsp_rsm;
+out:
+	return;
 }
 
-static int asm_sig_addr(char *buf, size_t size, const void *addr)
+static int asm_sig_addr(char *buf, size_t size, const void *vptr)
 {
 	int ret = -1;
+	const uint8_t *addr = vptr;
 
 	if (addr == NULL)
 		ret = snprintf(buf, size, "0");
-	else if (addr >= ctx.pgspan + ASM_PAGE_SIZE && addr <= ctx.pgspan + 2 * ASM_PAGE_SIZE + 127)
-		ret = snprintf(buf, size, "/ %+ld", (long)(addr - ctx.pgspan - 2 * ASM_PAGE_SIZE));
-	else if (addr >= ctx.pgspan + 2 * ASM_PAGE_SIZE && addr <= ctx.pgspan + 4 * ASM_PAGE_SIZE)
-		ret = snprintf(buf, size, "_ %+ld", (long)(addr - ctx.pgspan - 3 * ASM_PAGE_SIZE));
+	else if (addr >= ASM_PTR_XR_INSN_CONST && addr <= ASM_PTR_XR_INSN_END_CONST + 127)
+		ret = snprintf(buf, size, "/ %+ld", (long)(addr - ASM_PTR_XR_INSN_END_CONST));
+	else if (addr >= ASM_PTR_NONE_GUARD && addr <= ASM_PTR_NONE_STACK_END)
+		ret = snprintf(buf, size, "_ %+ld", (long)(addr - ASM_PTR_NONE_STACK));
 	else
-		ret = snprintf(buf, size, "%016lx", (unsigned long)addr);
+		ret = snprintf(buf, size, "%016lx", (unsigned long)(uintptr_t)addr);
 
 	return ret;
 }
 
 static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 {
+#if 0
+	if (!ctx.jmpvalid && setjmp(ctx.jmpenv) != 0) {
+		longjmp(ctx.jmpenv, 1);
+	}
+	ctx.jmpvalid = true;
+#endif
+
 	int sicode = siginfo->si_code;
 	const void *siaddr = siginfo->si_addr;
 	char addr[32] = "(nil)", tmp[32] = "", cr2[32] = "", rip[32] = "", rsp[32] = "";
@@ -284,6 +324,12 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 		:
 		: "g" (ctx.ds_rsm), "g" (ctx.es_rsm), "g" (ctx.gs_rsm)//, "g" (ctx.fs_rsm)
 		: "rax");
+
+	if (ctx.nested) {
+		printf("nested\n");
+		return;
+	}
+	ctx.nested = true;
 
 	if (signum == SIGBUS) {
 		name = "bus ";
@@ -366,8 +412,8 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 			memcpy(&ctx.stack, &uctx->uc_stack, sizeof ctx.stack);
 
 			ctx.insnlen = ctx.minlen;	// already zero page
-			uctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)(ctx.pgspan + 2 * ASM_PAGE_SIZE - ctx.insnlen);
-			uctx->uc_mcontext.gregs[REG_RSP] = (uintptr_t)(ctx.pgspan + 3 * ASM_PAGE_SIZE);
+			uctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)(ASM_PTR_XR_INSN_END_CONST - ctx.insnlen);
+			uctx->uc_mcontext.gregs[REG_RSP] = (uintptr_t)ASM_PTR_NONE_STACK;
 
 			memset(ctx.gregs, 0, sizeof ctx.gregs);
 			ctx.gregs[REG_EFL] = 1 << 8;
@@ -376,8 +422,9 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 			ctx.gregs[REG_RSP] = uctx->uc_mcontext.gregs[REG_RSP];
 			memcpy(uctx->uc_mcontext.gregs, ctx.gregs, sizeof ctx.gregs);
 
-			printf("will resume @ %p [%p], exec = %p [%p]\n", ctx.rip_rsm, ctx.rsp_rsm, ctx.pgspan + 2 * ASM_PAGE_SIZE - ctx.insnlen, ctx.pgspan + 3 * ASM_PAGE_SIZE);
-			return;
+			printf("will resume @ %p [%p], exec = %p [%p]\n"
+			, ctx.rip_rsm, ctx.rsp_rsm, ASM_PTR_XR_INSN_END_CONST - ctx.insnlen, ASM_PTR_NONE_STACK);
+			goto out;
 		}
 	}
 
@@ -386,7 +433,7 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 			goto skip;
 
 		if (signum == SIGSEGV && sicode == SEGV_ACCERR
-		&& siaddr == ctx.pgspan + 2 * ASM_PAGE_SIZE)
+		&& siaddr == ASM_PTR_NONE_GUARD)
 			goto skip;
 	}
 
@@ -400,12 +447,17 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 		code = tmp;
 	}
 
-	printf("%c %3u\t%4s ? %8s   ^ %02llx   $ %02llx   # %18s   @ %18s = ", (void *)(uintptr_t)uctx->uc_mcontext.gregs[REG_RIP] == ctx.pgspan + 2 * ASM_PAGE_SIZE - ctx.insnlen ? ' ' : '*', ctx.insnlen, name, code, (unsigned long long)uctx->uc_mcontext.gregs[REG_ERR], (unsigned long long)uctx->uc_mcontext.gregs[REG_TRAPNO], cr2, addr);
+	printf("%c %3u\t%4s ? %8s   ^ %02lx   $ %02lx   # %18s   @ %18s = "
+	, (void *)(uintptr_t)uctx->uc_mcontext.gregs[REG_RIP] == ASM_PTR_XR_INSN_END_CONST - ctx.insnlen ? ' ' : '*'
+	, ctx.insnlen, name, code, (unsigned long)uctx->uc_mcontext.gregs[REG_ERR]
+	, (unsigned long)uctx->uc_mcontext.gregs[REG_TRAPNO], cr2, addr);
 
 	asm_insn_print();
 
 skip:
 	asm_insn_inc(signum, siginfo, uctx);
+out:
+	ctx.nested = false;
 }
 
 static void sigfn_bus(int signum, siginfo_t *siginfo, void *puctx)
@@ -504,6 +556,7 @@ int main(int argc, char *argv[])
 	int ret = EXIT_FAILURE, ch, shmfd = -1;
 	char shmname[32];
 	struct timespec tsreal, tsmono;
+	uint16_t cs, ss;
 
 	while ((ch = getopt(argc, argv, "m:n:sv")) >= 0) {
 		switch (ch) {
@@ -549,16 +602,22 @@ int main(int argc, char *argv[])
 	shmfd = shm_open(shmname, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
 	if (shmfd < 0
 	|| shm_unlink(shmname) != 0
-	|| ftruncate(shmfd, ASM_PAGE_SIZE * 4) != 0)
+	|| ftruncate(shmfd, ASM_OFFT_LEN) != 0)
 		goto fail;
 
-	ctx.pgspan = mmap(NULL, ASM_PAGE_SIZE * 4, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#define ASM_PROT_RW	(PROT_READ | PROT_WRITE)
+#define ASM_PROT_XR	(PROT_EXEC | PROT_READ)
+#define ASM_MAP_RSV	(MAP_PRIVATE | MAP_ANONYMOUS)
+#define ASM_REMAP_RSV	(ASM_MAP_RSV | MAP_FIXED)
+#define ASM_REMAP_SHR	(MAP_SHARED | MAP_FIXED)
+
+	ctx.pgspan = mmap(NULL, ASM_OFFT_LEN, ASM_PROT_XR, ASM_MAP_RSV, -1, 0);
 	if (ctx.pgspan == MAP_FAILED)
 		goto fail;
 
-	if (mmap(ctx.pgspan + 0, ASM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, shmfd, 0) != ctx.pgspan + 0
-	|| mmap(ctx.pgspan + ASM_PAGE_SIZE, ASM_PAGE_SIZE, PROT_READ | PROT_EXEC, MAP_SHARED | MAP_FIXED, shmfd, 0) != ctx.pgspan + ASM_PAGE_SIZE
-	|| mmap(ctx.pgspan + 2 * ASM_PAGE_SIZE, 2 * ASM_PAGE_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != ctx.pgspan + 2 * ASM_PAGE_SIZE)
+	if (mmap(ASM_PTR_RW_INSN, ASM_PAGE_SIZE, ASM_PROT_RW, ASM_REMAP_SHR, shmfd, 0) != ASM_PTR_RW_INSN
+	|| mmap(ASM_PTR_XR_INSN, ASM_PAGE_SIZE, ASM_PROT_XR, ASM_REMAP_SHR, shmfd, 0) != ASM_PTR_XR_INSN
+	|| mmap(ASM_PTR_NONE_GUARD, 2 * ASM_PAGE_SIZE, PROT_NONE, ASM_REMAP_RSV, -1, 0) != ASM_PTR_NONE_GUARD)
 		goto fail;
 
 	if (sigsetup(&ctx) != 0)
@@ -577,8 +636,6 @@ int main(int argc, char *argv[])
 		:
 		: "rax");
 
-	uint16_t cs, ss;
-
 	asm volatile(
 		"mov %%cs, %%ax\n"
 		"mov %%ax, %0\n"
@@ -588,7 +645,8 @@ int main(int argc, char *argv[])
 		:
 		: "rax");
 
-	printf("GOT: cs = %x, ds = %x, es = %x, fs = %x, gs = %x, ss = %x\n", (unsigned)cs, (unsigned)ctx.ds_rsm, (unsigned)ctx.es_rsm, (unsigned)ctx.fs_rsm, (unsigned)ctx.gs_rsm, (unsigned)ss);
+	printf("GOT: cs = %x, ds = %x, es = %x, fs = %x, gs = %x, ss = %x\n"
+	, (unsigned)cs, (unsigned)ctx.ds_rsm, (unsigned)ctx.es_rsm, (unsigned)ctx.fs_rsm, (unsigned)ctx.gs_rsm, (unsigned)ss);
 
 	asm volatile (
 		"mov $0, %%ax\n"
@@ -606,8 +664,16 @@ int main(int argc, char *argv[])
 
 	ret = EXIT_SUCCESS;
 fail:
+	if (ctx.pgspan != MAP_FAILED && munmap(ASM_PTR_BASE, ASM_OFFT_LEN) != 0) {
+		perror("munmap()");
+		ret = EXIT_FAILURE;
+	}
+	if (shmfd >= 0 && close(shmfd) != 0) {
+		perror("close()");
+		ret = EXIT_FAILURE;
+	}
 	return ret;
 usage:
-	fprintf(stderr, "%s [ -m min ] [ -n max ]\n", argv[0]);
+	fprintf(stderr, "%s [ -v (verbose) ] [ -s (depth-first) ] [ -m min ] [ -n max ]\n", argv[0]);
 	goto fail;
 }
