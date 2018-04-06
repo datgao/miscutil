@@ -22,40 +22,49 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdlib.h>
 #ifdef MY_DEBUG
 #include <stdio.h>
 #endif
 
 #define COND_ASSIGN_DLSYM_OR_DIE(name)					\
-	if (libc_##name == NULL) {					\
-		*(void **)(&libc_##name) = dlsym(RTLD_NEXT, #name);	\
-		if (libc_##name == NULL)				\
-		_exit(EXIT_FAILURE);					\
-	}
+	do {								\
+		if (libc_##name == NULL) {					\
+			*(void **)(&libc_##name) = dlsym(RTLD_NEXT, #name);	\
+			if (libc_##name == NULL)				\
+			_exit(EXIT_FAILURE);					\
+		}							\
+	} while (0)
 
 #define ASSIGN_DLSYM_IF_EXIST(name)					\
-	*(void **)(&libc_##name) = dlsym(RTLD_NEXT, #name);
+	do {								\
+		*(void **)(&libc_##name) = dlsym(RTLD_NEXT, #name);	\
+	} while (0)
 
 #ifdef MY_DEBUG
-#define DEBUG_PERROR(msg)	do { perror(msg); } while (0);
+#define DEBUG_PERROR(msg)	do { if (msg != NULL) perror(msg); } while (0)
 #else
-#define DEBUG_PERROR(msg)	do { } while (0);
+#define DEBUG_PERROR(msg)	do { } while (0)
 #endif
 
 #ifdef FORCE_SYNC
 #define COND_CALL_SYNC(name, fd, msg)					\
 	do {								\
+		int error = errno;					\
 		if (libc_##name == NULL)				\
-			ASSIGN_DLSYM_IF_EXIST(name)			\
+			ASSIGN_DLSYM_IF_EXIST(name);			\
 		if (libc_##name != NULL && libc_##name(fd) != 0)	\
-			DEBUG_PERROR(#name msg)		\
-	} while (0);
+			DEBUG_PERROR(#name msg);			\
+		errno = error;						/
+	} while (0)
 #else
-#define COND_CALL_SYNC(name, fd, msg)	do { } while (0);
+#define COND_CALL_SYNC(name, fd, msg)	do { } while (0)
 #endif
 
 #if _POSIX_SYNCHRONIZED_IO > 0
@@ -64,9 +73,8 @@
 #define SYNC_CALL	fsync
 #endif
 
-#if 0
 static int (*libc_open)(const char *, int, ...) = NULL;
-#endif
+static int (*libc_openat)(int, const char *, int, ...) = NULL;
 static ssize_t (*libc_read)(int, void *, size_t) = NULL;
 static ssize_t (*libc_write)(int, const void *, size_t) = NULL;
 static ssize_t (*libc_pread)(int, void *, size_t, off_t) = NULL;
@@ -84,39 +92,106 @@ static void *(*libc_mmap)(void *, size_t, int, int, int, off_t) = NULL;
 static void *(*libc_mmap2)(void *, size_t, int, int, int, off_t) = NULL;
 static int (*libc_msync)(void *, size_t, int) = NULL;
 static int (*libc_munmap)(void *, size_t) = NULL;
+static ssize_t (*libc_vmsplice)(int, const struct iovec *, unsigned long, unsigned int) = NULL;
+static ssize_t (*libc_splice)(int, loff_t *, int, loff_t *, size_t, unsigned int) = NULL;
+static ssize_t (*libc_sendfile)(int, int, off_t *, size_t) = NULL;
 
-void __attribute__((constructor)) madvmerge_init(void)
+void __attribute__((constructor)) nocache_init(void)
 {
-#if 0
-	ASSIGN_DLSYM_IF_EXIST(open)
-#endif
-	ASSIGN_DLSYM_IF_EXIST(read)
-	ASSIGN_DLSYM_IF_EXIST(write)
-	ASSIGN_DLSYM_IF_EXIST(pread)
-	ASSIGN_DLSYM_IF_EXIST(pwrite)
-	ASSIGN_DLSYM_IF_EXIST(readv)
-	ASSIGN_DLSYM_IF_EXIST(writev)
-	ASSIGN_DLSYM_IF_EXIST(preadv)
-	ASSIGN_DLSYM_IF_EXIST(pwritev)
-	ASSIGN_DLSYM_IF_EXIST(fsync)
+	ASSIGN_DLSYM_IF_EXIST(open);
+	ASSIGN_DLSYM_IF_EXIST(openat);
+	ASSIGN_DLSYM_IF_EXIST(read);
+	ASSIGN_DLSYM_IF_EXIST(write);
+	ASSIGN_DLSYM_IF_EXIST(pread);
+	ASSIGN_DLSYM_IF_EXIST(pwrite);
+	ASSIGN_DLSYM_IF_EXIST(readv);
+	ASSIGN_DLSYM_IF_EXIST(writev);
+	ASSIGN_DLSYM_IF_EXIST(preadv);
+	ASSIGN_DLSYM_IF_EXIST(pwritev);
+	ASSIGN_DLSYM_IF_EXIST(fsync);
 #if _POSIX_SYNCHRONIZED_IO > 0
-	ASSIGN_DLSYM_IF_EXIST(fdatasync)
+	ASSIGN_DLSYM_IF_EXIST(fdatasync);
 #endif
-	ASSIGN_DLSYM_IF_EXIST(close)
-	ASSIGN_DLSYM_IF_EXIST(mmap)
-	ASSIGN_DLSYM_IF_EXIST(mmap2)
-	ASSIGN_DLSYM_IF_EXIST(msync)
-	ASSIGN_DLSYM_IF_EXIST(munmap)
+	ASSIGN_DLSYM_IF_EXIST(close);
+	ASSIGN_DLSYM_IF_EXIST(mmap);
+	ASSIGN_DLSYM_IF_EXIST(mmap2);
+	ASSIGN_DLSYM_IF_EXIST(msync);
+	ASSIGN_DLSYM_IF_EXIST(munmap);
+	ASSIGN_DLSYM_IF_EXIST(vmsplice);
+	ASSIGN_DLSYM_IF_EXIST(splice);
+	ASSIGN_DLSYM_IF_EXIST(sendfile);
+}
+
+#define NOCACHE_PERROR(fd, msg) 		\
+	do {					\
+		int error = errno;		\
+		if (posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)	\
+			DEBUG_PERROR(msg);	\
+		errno = error;			\
+	} while (0)				\
+
+#define NOCACHE_NOTSEQ_PERROR(fd, msg) 		\
+	do {					\
+		int error = errno;		\
+		if (posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM) != 0)	\
+			DEBUG_PERROR(msg);	\
+		errno = error;			\
+	} while (0)				\
+
+#define NOCACHE_MAP_PERROR(addr, length, msg)	\
+	do {					\
+		int error = errno;		\
+		if (madvise(addr, length, MADV_DONTNEED) != 0)	\
+			DEBUG_PERROR(msg);	\
+		errno = error;			\
+	} while (0)
+
+int open(const char *pathname, int flags, ...)
+{
+	va_list ap;
+	int fd;
+	mode_t mode = 0;
+
+	va_start(ap, flags);
+	if ((flags & O_CREAT) != 0)
+		mode = va_arg(ap, mode_t);
+	va_end(ap);
+	COND_ASSIGN_DLSYM_OR_DIE(open);
+	fd = libc_open(pathname, flags, mode);
+	if (fd >= 0) {
+		NOCACHE_NOTSEQ_PERROR(fd, NULL);
+		NOCACHE_PERROR(fd, NULL);
+	}
+	return fd;
+}
+
+int openat(int dirfd, const char *pathname, int flags, ...)
+{
+	va_list ap;
+	int fd;
+	mode_t mode = 0;
+
+	va_start(ap, flags);
+	if ((flags & O_CREAT) != 0)
+		mode = va_arg(ap, mode_t);
+	va_end(ap);
+	COND_ASSIGN_DLSYM_OR_DIE(openat);
+	fd = libc_openat(dirfd, pathname, flags, mode);
+	if (fd >= 0) {
+		NOCACHE_NOTSEQ_PERROR(fd, NULL);
+		NOCACHE_PERROR(fd, NULL);
+	}
+	return fd;
 }
 
 ssize_t read(int fd, void *buf, size_t count)
 {
 	ssize_t ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(read)
+	COND_ASSIGN_DLSYM_OR_DIE(read);
 	ret = libc_read(fd, buf, count);
-	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside read()")
+	if (ret > 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside read()");
 	return ret;
 }
 
@@ -124,10 +199,10 @@ ssize_t write(int fd, const void *buf, size_t count)
 {
 	ssize_t ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(write)
+	COND_ASSIGN_DLSYM_OR_DIE(write);
 	ret = libc_write(fd, buf, count);
-	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside write()")
+	if (ret > 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside write()");
 	return ret;
 }
 
@@ -135,10 +210,10 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 {
 	ssize_t ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(pread)
+	COND_ASSIGN_DLSYM_OR_DIE(pread);
 	ret = libc_pread(fd, buf, count, offset);
-	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pread()")
+	if (ret > 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside pread()");
 	return ret;
 }
 
@@ -146,10 +221,10 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
 	ssize_t ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(pwrite)
+	COND_ASSIGN_DLSYM_OR_DIE(pwrite);
 	ret = libc_pwrite(fd, buf, count, offset);
-	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()")
+	if (ret > 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()");
 	return ret;
 }
 
@@ -157,10 +232,10 @@ ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 {
 	ssize_t ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(readv)
+	COND_ASSIGN_DLSYM_OR_DIE(readv);
 	ret = libc_readv(fd, iov, iovcnt);
-	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pread()")
+	if (ret > 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside pread()");
 	return ret;
 }
 
@@ -168,10 +243,10 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
 	ssize_t ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(writev)
+	COND_ASSIGN_DLSYM_OR_DIE(writev);
 	ret = libc_writev(fd, iov, iovcnt);
-	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()")
+	if (ret > 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()");
 	return ret;
 }
 
@@ -179,10 +254,10 @@ ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
 	ssize_t ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(preadv)
+	COND_ASSIGN_DLSYM_OR_DIE(preadv);
 	ret = libc_preadv(fd, iov, iovcnt, offset);
-	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pread()")
+	if (ret > 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside pread()");
 	return ret;
 }
 
@@ -190,10 +265,10 @@ ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 {
 	ssize_t ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(pwritev)
+	COND_ASSIGN_DLSYM_OR_DIE(pwritev);
 	ret = libc_pwritev(fd, iov, iovcnt, offset);
-	if (ret > 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()")
+	if (ret > 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside pwrite()");
 	return ret;
 }
 
@@ -201,10 +276,10 @@ int fsync(int fd)
 {
 	int ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(fsync)
+	COND_ASSIGN_DLSYM_OR_DIE(fsync);
 	ret = libc_fsync(fd);
-	if (ret != 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside fsync()")
+	if (ret == 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside fsync()");
 	return ret;
 }
 
@@ -213,23 +288,19 @@ int fdatasync(int fd)
 {
 	int ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(fdatasync)
+	COND_ASSIGN_DLSYM_OR_DIE(fdatasync);
 	ret = libc_fdatasync(fd);
-	if (ret != 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside fdatasync()")
+	if (ret == 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside fdatasync()");
 	return ret;
 }
 #endif
 
 int close(int fd)
 {
-	COND_ASSIGN_DLSYM_OR_DIE(close)
-
-	COND_CALL_SYNC(SYNC_CALL, fd, " inside close()")
-
-	if (posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside close()")
-
+	COND_ASSIGN_DLSYM_OR_DIE(close);
+	COND_CALL_SYNC(SYNC_CALL, fd, " inside close()");
+	NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside close()");
 	return libc_close(fd);
 }
 
@@ -237,12 +308,13 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
 	void *ptr;
 
-	COND_ASSIGN_DLSYM_OR_DIE(mmap)
+	COND_ASSIGN_DLSYM_OR_DIE(mmap);
+	if ((flags & MAP_FIXED) != 0)
+		NOCACHE_MAP_PERROR(addr, length, NULL);
 	ptr = libc_mmap(addr, length, prot, flags, fd, offset);
 	if (fd >= 0 && prot != PROT_NONE && ptr != MAP_FAILED
-	&& (flags & MAP_ANON) == 0 && (flags & MAP_ANONYMOUS) == 0
-	&& posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside mmap()")
+	&& (flags & MAP_ANON) == 0 && (flags & MAP_ANONYMOUS) == 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside mmap()");
 	return ptr;
 }
 
@@ -250,12 +322,13 @@ void *mmap2(void *addr, size_t length, int prot, int flags, int fd, off_t pgoffs
 {
 	void *ptr;
 
-	COND_ASSIGN_DLSYM_OR_DIE(mmap2)
+	COND_ASSIGN_DLSYM_OR_DIE(mmap2);
+	if ((flags & MAP_FIXED) != 0)
+		NOCACHE_MAP_PERROR(addr, length, NULL);
 	ptr = libc_mmap2(addr, length, prot, flags, fd, pgoffset);
 	if (fd >= 0 && prot != PROT_NONE && ptr != MAP_FAILED
-	&& (flags & MAP_ANON) == 0 && (flags & MAP_ANONYMOUS) == 0
-	&& posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
-		DEBUG_PERROR("posix_fadvise(POSIX_FADV_DONTNEED) inside mmap2()")
+	&& (flags & MAP_ANON) == 0 && (flags & MAP_ANONYMOUS) == 0)
+		NOCACHE_PERROR(fd, "posix_fadvise(POSIX_FADV_DONTNEED) inside mmap2()");
 	return ptr;
 }
 
@@ -263,17 +336,58 @@ int msync(void *addr, size_t length, int flags)
 {
 	int ret;
 
-	COND_ASSIGN_DLSYM_OR_DIE(munmap)
+	COND_ASSIGN_DLSYM_OR_DIE(munmap);
 	ret = libc_msync(addr, length, (flags & ~MS_ASYNC) | MS_SYNC);
-	if (ret != 0 && madvise(addr, length, MADV_DONTNEED) != 0)
-		DEBUG_PERROR("madvise(MADV_DONTNEED) inside msync()")
+	if (ret == 0)
+		NOCACHE_MAP_PERROR(addr, length, "madvise(MADV_DONTNEED) inside msync()");
 	return ret;
 }
 
 int munmap(void *addr, size_t length)
 {
-	COND_ASSIGN_DLSYM_OR_DIE(munmap)
-	if (madvise(addr, length, MADV_DONTNEED) != 0)
-		DEBUG_PERROR("madvise(MADV_DONTNEED) inside munmap()")
+	COND_ASSIGN_DLSYM_OR_DIE(munmap);
+	NOCACHE_MAP_PERROR(addr, length, "madvise(MADV_DONTNEED) inside munmap()");
 	return libc_munmap(addr, length);
 }
+
+ssize_t vmsplice(int fd, const struct iovec *iov, unsigned long nr_segs, unsigned int flags)
+{
+	unsigned long i;
+	size_t len;
+	void *ptr;
+	const struct iovec *piov;
+
+	COND_ASSIGN_DLSYM_OR_DIE(vmsplice);
+	for (i = 0, piov = iov; i < nr_segs; i++, piov++) {
+		ptr = (void *)((uintptr_t)piov->iov_base & ~(uintptr_t)0x0fff);
+		len = piov->iov_len + ((uintptr_t)piov->iov_base & (uintptr_t)0x0fff);
+		if ((len & (size_t)0x0fff) != 0) {
+			len = (len & ~(size_t)0xfff) + 0x1000;
+			NOCACHE_MAP_PERROR(ptr, len, NULL);
+		}
+	}
+	return libc_vmsplice(fd, iov, nr_segs, flags);
+}
+
+ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags)
+{
+	ssize_t ret;
+
+	COND_ASSIGN_DLSYM_OR_DIE(splice);
+	ret = libc_splice(fd_in, off_in, fd_out, off_out, len, flags);
+	if (ret > 0 && posix_fadvise(fd_in, 0, 0, POSIX_FADV_DONTNEED) != 9)
+		NOCACHE_PERROR(fd_in, NULL);
+	return ret;
+}
+
+ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+{
+	size_t ret;
+
+	COND_ASSIGN_DLSYM_OR_DIE(sendfile);
+	ret = libc_sendfile(out_fd, in_fd, offset, count);
+	if (ret > 0)
+		NOCACHE_PERROR(in_fd, NULL);
+	return ret;
+}
+

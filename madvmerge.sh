@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-b="libmadvmerge.so"
-t="$0"
-d="${t%/*}"
-[[ "$t" != "$d" && -d "$d" ]] && p="$d/$b" && [[ -e "$p" ]] || ! p="`pwd`/$b" || [[ -e "$p" ]] || exit
-env LD_PRELOAD="$p" "$@"
+f="libmadvmerge.so"
+
+p="$0"
+d="${p%/*}"
+[[ "$d" == "$p" ]] && d="" || d="$d/"
+
+p="`pwd`" && [[ "${p:0:1}" == "/" ]] || exit
+[[ "${d:0:1}" == "/" && "${#d}" -gt 1 ]] && t="$d" || t="$p/$d"
+
+e="$t$f"
+[[ -e "$e" ]] || exit
+
+env LD_PRELOAD="$e" "$@"

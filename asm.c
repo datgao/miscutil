@@ -50,8 +50,16 @@
 
 #if defined(__x86_64__)
 # define	ASM_AMD64
+# define	ASM_STR_AX	"rax"
+# define	ASM_REG_IP	REG_RIP
+# define	ASM_REG_SP	REG_RSP
+# define	ASM_CR2(uctx)	((uctx)->uc_mcontext.gregs[REG_CR2])
 #elif defined(__i386__)
 # define	ASM_X86
+# define	ASM_STR_AX	"eax"
+# define	ASM_REG_IP	REG_EIP
+# define	ASM_REG_SP	REG_ESP
+# define	ASM_CR2(uctx)	((uctx)->uc_mcontext.cr2)
 #else
 # error "Unknown CPU architecture."
 #endif
@@ -175,6 +183,10 @@ static struct asm_ctx ctx = {	// init
 	.nested = false,
 };
 
+extern void asm_test();
+
+__asm__(".global asm_test\ncall asm_sig_print\nret\n");
+
 static void asm_insn_print()
 {
 	unsigned i;
@@ -191,6 +203,8 @@ static bool asm_bad(unsigned len, const uint8_t *pfirst, const uint8_t *plast)
 {
 	bool ret = false;
 
+#ifdef ASM_AMD64
+
 	if (--len > 0) {	// (Intel) MOV FS, GPreg / (AT&T) MOV %GPreg, %FS
 		if (pfirst[0] == 0x8e && (pfirst[1] & 0x38) == 0x20)
 			goto bad;
@@ -202,6 +216,23 @@ static bool asm_bad(unsigned len, const uint8_t *pfirst, const uint8_t *plast)
 		if (*pfirst++ == 0x64)
 			goto bad;
 	}
+
+#else
+
+	if (--len > 0) {	// (Intel) MOV Sreg, GPreg / (AT&T) MOV %GPreg, %Sreg
+		if (pfirst[0] == 0x8e)
+			goto bad;
+		if (plast[-1] == 0x8e)
+			goto bad;
+	}
+
+	while (len-- > 0) {	// FS:/GS: or ES:/CS:/SS:/DS: override prefix
+		if ((*pfirst & 0xfe) == 0x64)// || (*pfirst & 0xe7) == 0x26)
+			goto bad;
+		pfirst++;
+	}
+
+#endif
 
 out:
 	return ret;
@@ -258,24 +289,32 @@ resume:
 		goto again;
 	memcpy(uctx->uc_mcontext.gregs, ctx.gregs, sizeof ctx.gregs);
 	memcpy(&uctx->uc_stack, &ctx.stack, sizeof ctx.stack);
-	uctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)(pxend - ctx.insnlen);
-	uctx->uc_mcontext.gregs[REG_RSP] = (uintptr_t)ASM_PTR_NONE_STACK;
+	uctx->uc_mcontext.gregs[ASM_REG_IP] = (uintptr_t)(pxend - ctx.insnlen);
+	uctx->uc_mcontext.gregs[ASM_REG_SP] = (uintptr_t)ASM_PTR_NONE_STACK;
+
+#if 0
+#ifdef ASM_AMD64
 	asm volatile (
 		"mov $0, %%ax\n"
 		"mov %%ax, %%ds\n"
 		"mov %%ax, %%es\n"
-		//"mov %%ax, %%fs\n"
+#ifdef ASM_X86
+		"mov %%ax, %%fs\n"
+#endif
 		"mov %%ax, %%gs\n"
 		:
 		:
-		: "rax");
+		: ASM_STR_AX);
+#endif
+#endif
+
 	goto out;
 
 finish:
 	memcpy(uctx->uc_mcontext.gregs, ctx.gregs_rsm, sizeof ctx.gregs_rsm);
 	memcpy(&uctx->uc_stack, &ctx.stack_rsm, sizeof ctx.stack_rsm);
-	uctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)ctx.rip_rsm;
-	uctx->uc_mcontext.gregs[REG_RSP] = (uintptr_t)ctx.rsp_rsm;
+	uctx->uc_mcontext.gregs[ASM_REG_IP] = (uintptr_t)ctx.rip_rsm;
+	uctx->uc_mcontext.gregs[ASM_REG_SP] = (uintptr_t)ctx.rsp_rsm;
 out:
 	return;
 }
@@ -312,6 +351,7 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 	const char *name = "", *code = "";
 	ucontext_t *uctx = (ucontext_t *)puctx;
 
+#if 0
 	asm volatile(
 		"mov %0, %%ax\n"
 		"mov %%ax, %%ds\n"
@@ -319,11 +359,17 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 		"mov %%ax, %%es\n"
 		"mov %2, %%ax\n"
 		"mov %%ax, %%gs\n"
-		//"mov %3, %%ax\n"
-		//"mov %%ax, %%fs\n"
+#ifdef ASM_X86
+		"mov %3, %%ax\n"
+		"mov %%ax, %%fs\n"
+#endif
 		:
-		: "g" (ctx.ds_rsm), "g" (ctx.es_rsm), "g" (ctx.gs_rsm)//, "g" (ctx.fs_rsm)
-		: "rax");
+		: "g" (ctx.ds_rsm), "g" (ctx.es_rsm), "g" (ctx.gs_rsm)
+#ifdef ASM_X86
+		, "g" (ctx.fs_rsm)
+#endif
+		: ASM_STR_AX);
+#endif
 
 	if (ctx.nested) {
 		printf("nested\n");
@@ -403,23 +449,33 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 #endif
 
 		if (ctx.rip_rsm == NULL) {
-			ctx.rip_rsm = (void *)(uintptr_t)uctx->uc_mcontext.gregs[REG_RIP];
-			ctx.rsp_rsm = (void *)(uintptr_t)uctx->uc_mcontext.gregs[REG_RSP];
+			ctx.rip_rsm = (void *)(uintptr_t)uctx->uc_mcontext.gregs[ASM_REG_IP];
+			ctx.rsp_rsm = (void *)(uintptr_t)uctx->uc_mcontext.gregs[ASM_REG_SP];
 			memcpy(ctx.gregs_rsm, uctx->uc_mcontext.gregs, sizeof ctx.gregs_rsm);
 			memcpy(&ctx.stack_rsm, &uctx->uc_stack, sizeof ctx.stack_rsm);
+			printf("Stashing stack %p\n", ctx.stack_rsm.ss_sp);
 
 			memset(&uctx->uc_stack, 0, sizeof ctx.stack);
 			memcpy(&ctx.stack, &uctx->uc_stack, sizeof ctx.stack);
 
 			ctx.insnlen = ctx.minlen;	// already zero page
-			uctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)(ASM_PTR_XR_INSN_END_CONST - ctx.insnlen);
-			uctx->uc_mcontext.gregs[REG_RSP] = (uintptr_t)ASM_PTR_NONE_STACK;
+			uctx->uc_mcontext.gregs[ASM_REG_IP] = (uintptr_t)(ASM_PTR_XR_INSN_END_CONST - ctx.insnlen);
+			uctx->uc_mcontext.gregs[ASM_REG_SP] = (uintptr_t)ASM_PTR_NONE_STACK;
 
 			memset(ctx.gregs, 0, sizeof ctx.gregs);
 			ctx.gregs[REG_EFL] = 1 << 8;
+#ifdef ASM_AMD64
 			ctx.gregs[REG_CSGSFS] = uctx->uc_mcontext.gregs[REG_CSGSFS] & 0xffff;
-			ctx.gregs[REG_RIP] = uctx->uc_mcontext.gregs[REG_RIP];
-			ctx.gregs[REG_RSP] = uctx->uc_mcontext.gregs[REG_RSP];
+#else
+			ctx.gregs[REG_CS] = uctx->uc_mcontext.gregs[REG_CS] & 0xffff;
+			ctx.gregs[REG_GS] = uctx->uc_mcontext.gregs[REG_GS] & 0xffff;
+			ctx.gregs[REG_FS] = uctx->uc_mcontext.gregs[REG_FS] & 0xffff;
+			ctx.gregs[REG_DS] = uctx->uc_mcontext.gregs[REG_DS] & 0xffff;
+			ctx.gregs[REG_ES] = uctx->uc_mcontext.gregs[REG_ES] & 0xffff;
+			ctx.gregs[REG_SS] = uctx->uc_mcontext.gregs[REG_SS] & 0xffff;
+#endif
+			ctx.gregs[ASM_REG_IP] = uctx->uc_mcontext.gregs[ASM_REG_IP];
+			ctx.gregs[ASM_REG_SP] = uctx->uc_mcontext.gregs[ASM_REG_SP];
 			memcpy(uctx->uc_mcontext.gregs, ctx.gregs, sizeof ctx.gregs);
 
 			printf("will resume @ %p [%p], exec = %p [%p]\n"
@@ -438,9 +494,9 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 	}
 
 	asm_sig_addr(addr, sizeof addr, siaddr);
-	asm_sig_addr(cr2, sizeof cr2, (const void *)(uintptr_t)uctx->uc_mcontext.gregs[REG_CR2]);
-	asm_sig_addr(rip, sizeof rip, (const void *)(uintptr_t)uctx->uc_mcontext.gregs[REG_RIP]);
-	asm_sig_addr(rsp, sizeof rsp, (const void *)(uintptr_t)uctx->uc_mcontext.gregs[REG_RSP]);
+	asm_sig_addr(cr2, sizeof cr2, (const void *)(uintptr_t)ASM_CR2(uctx));
+	asm_sig_addr(rip, sizeof rip, (const void *)(uintptr_t)uctx->uc_mcontext.gregs[ASM_REG_IP]);
+	asm_sig_addr(rsp, sizeof rsp, (const void *)(uintptr_t)uctx->uc_mcontext.gregs[ASM_REG_SP]);
 
 	if (code == NULL || code[0] == '\0') {
 		snprintf(tmp, sizeof tmp, "#%d", sicode);
@@ -448,7 +504,7 @@ static void asm_sig_print(int signum, const siginfo_t *siginfo, void *puctx)
 	}
 
 	printf("%c %3u\t%4s ? %8s   ^ %02lx   $ %02lx   # %18s   @ %18s = "
-	, (void *)(uintptr_t)uctx->uc_mcontext.gregs[REG_RIP] == ASM_PTR_XR_INSN_END_CONST - ctx.insnlen ? ' ' : '*'
+	, (void *)(uintptr_t)uctx->uc_mcontext.gregs[ASM_REG_IP] == ASM_PTR_XR_INSN_END_CONST - ctx.insnlen ? ' ' : '*'
 	, ctx.insnlen, name, code, (unsigned long)uctx->uc_mcontext.gregs[REG_ERR]
 	, (unsigned long)uctx->uc_mcontext.gregs[REG_TRAPNO], cr2, addr);
 
@@ -543,7 +599,7 @@ static unsigned strtounum(const char *str)
 	char *ep = NULL;
 
 	val = strtol(str, &ep, 0);
-	if (val <= 0 || val > UINT_MAX || ep == NULL || *ep != '\0')
+	if (val <= 0 || val > (long)MIN((long long)UINT_MAX, (long long)LONG_MAX) || ep == NULL || *ep != '\0')
 		goto fail;
 
 	ret = val;
@@ -634,7 +690,7 @@ int main(int argc, char *argv[])
 		"mov %%ax, %3\n"
 		: "=g" (ctx.ds_rsm), "=g" (ctx.es_rsm), "=g" (ctx.gs_rsm), "=g" (ctx.fs_rsm)
 		:
-		: "rax");
+		: ASM_STR_AX);
 
 	asm volatile(
 		"mov %%cs, %%ax\n"
@@ -643,20 +699,26 @@ int main(int argc, char *argv[])
 		"mov %%ax, %1\n"
 		: "=g" (cs), "=g" (ss)
 		:
-		: "rax");
+		: ASM_STR_AX);
 
 	printf("GOT: cs = %x, ds = %x, es = %x, fs = %x, gs = %x, ss = %x\n"
 	, (unsigned)cs, (unsigned)ctx.ds_rsm, (unsigned)ctx.es_rsm, (unsigned)ctx.fs_rsm, (unsigned)ctx.gs_rsm, (unsigned)ss);
 
+#if 0
+#ifdef ASM_AMD64
 	asm volatile (
 		"mov $0, %%ax\n"
 		"mov %%ax, %%ds\n"
 		"mov %%ax, %%es\n"
-		//"mov %%ax, %%fs\n"
+#ifdef ASM_X86_
+		"mov %%ax, %%fs\n"
+#endif
 		"mov %%ax, %%gs\n"
 		:
 		:
-		: "rax");
+		: ASM_STR_AX);
+#endif
+#endif
 
 	asm volatile ("int3");
 
