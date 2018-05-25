@@ -17,6 +17,8 @@
 */
 
 #define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
+#include <sys/user.h>	// PAGE_SIZE
 #include <sys/mman.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -24,7 +26,17 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <string.h>
+#ifdef MY_DEBUG
 #include <stdio.h>
+#endif
+
+#ifndef AVOID_CALLOC
+#define TRY_CALLOC
+#endif
+
+#ifndef AVOID_MPROTECT
+#define TRY_MPROTECT
+#endif
 
 #define ASSIGN_DLSYM_IF_EXIST(name)					\
 	do {								\
@@ -53,57 +65,52 @@ static int (*libc_brk)() = NULL;
 static void *(*libc_sbrk)(intptr_t) = NULL;
 static void *(*libc_mmap)(void *, size_t, int, int, int, off_t) = NULL;
 static void *(*libc_mremap)(void *, size_t, size_t, int flags, ...) = NULL;
-//static void *(*libc_calloc)(size_t, size_t) = NULL;
+#ifdef TRY_CALLOC
+static void *(*libc_calloc)(size_t, size_t) = NULL;
+#endif
 static void *(*libc_valloc)(size_t) = NULL;
 static void *(*libc_memalign)(size_t, size_t) = NULL;
 static int (*libc_posix_memalign)(void **, size_t, size_t) = NULL;
 static void *(*libc_mmap2)(void *, size_t, int, int, int, off_t) = NULL;
-#if 0
-static int (*libc_mprotect)(const void *, size_t, int) = NULL;
+#ifdef TRY_MPROTECT
+static int (*libc_mprotect)(void *, size_t, int) = NULL;
 #endif
-static long pagesize = 0;
-static long page_base_mask, page_offset_mask;
+
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 0
+#endif
+
+static long pagesize = PAGE_SIZE;
+static uintptr_t page_base_mask;
+static uintptr_t page_offset_mask;
 
 void madvmerge_page_init()
 {
 	if (pagesize == 0) {
 		int error = errno;
+#ifdef _SC_PAGESIZE
 		pagesize = sysconf(_SC_PAGESIZE);
-		if (pagesize < 0) {
-			perror("sysconf()");
-			_exit(1);
+#endif
+		if (pagesize <= 0) {
+			//if (pagesize < 0) perror("sysconf()");
+			_exit(42);
 		}
-		page_offset_mask = pagesize - 1;
-		page_base_mask = ~page_offset_mask;
 		errno = error;
 	}
-}
-
-void __attribute__((constructor)) madvmerge_init()
-{
-	ASSIGN_DLSYM_IF_EXIST(malloc);
-	ASSIGN_DLSYM_IF_EXIST(realloc);
-	ASSIGN_DLSYM_IF_EXIST(brk);
-	ASSIGN_DLSYM_IF_EXIST(sbrk);
-	ASSIGN_DLSYM_IF_EXIST(mmap);
-	ASSIGN_DLSYM_IF_EXIST(mremap);
-	//ASSIGN_DLSYM_IF_EXIST(calloc);
-	ASSIGN_DLSYM_IF_EXIST(valloc);
-	ASSIGN_DLSYM_IF_EXIST(memalign);
-	ASSIGN_DLSYM_IF_EXIST(posix_memalign);
-	ASSIGN_DLSYM_IF_EXIST(mmap2);
-#if 0
-	ASSIGN_DLSYM_IF_EXIST(mprotect);
-#endif
-	madvmerge_page_init();
+	page_offset_mask = pagesize - 1;
+	page_base_mask = ~page_offset_mask;
 }
 
 void madvmerge_align(void *ptr, size_t *size, void **aligned)
 {
-	*aligned = (void *)((uintptr_t)ptr & (uintptr_t)page_base_mask);
-	*size += (uintptr_t)ptr & (uintptr_t)page_offset_mask;
-	if ((*size & (size_t)page_offset_mask) != 0)
-		*size = (*size & (size_t)page_base_mask) + pagesize;
+	if (*size == 0) ++*size;
+	*aligned = (void *)((uintptr_t)ptr & page_base_mask);
+	*size = (*size + (uintptr_t)ptr - (uintptr_t)*aligned + page_offset_mask) & page_base_mask;
+#if 0
+	*size += (uintptr_t)ptr & page_offset_mask;
+	if ((*size & page_offset_mask) != 0)
+		*size = (*size & page_base_mask) + pagesize;
+#endif
 }
 
 void madvmerge_madvise_mergeable_page_aligned(void *aligned, size_t size)
@@ -120,6 +127,37 @@ void madvmerge_madvise_mergeable(void *ptr, size_t size)
 
 	madvmerge_align(ptr, &size, &aligned);
 	madvmerge_madvise_mergeable_page_aligned(aligned, size);
+}
+
+void __attribute__((constructor)) madvmerge_init()
+{
+	ASSIGN_DLSYM_IF_EXIST(malloc);
+	ASSIGN_DLSYM_IF_EXIST(realloc);
+	ASSIGN_DLSYM_IF_EXIST(brk);
+	ASSIGN_DLSYM_IF_EXIST(sbrk);
+	ASSIGN_DLSYM_IF_EXIST(mmap);
+	ASSIGN_DLSYM_IF_EXIST(mremap);
+#ifdef TRY_CALLOC
+	ASSIGN_DLSYM_IF_EXIST(calloc);
+#endif
+	ASSIGN_DLSYM_IF_EXIST(valloc);
+	ASSIGN_DLSYM_IF_EXIST(memalign);
+	ASSIGN_DLSYM_IF_EXIST(posix_memalign);
+	ASSIGN_DLSYM_IF_EXIST(mmap2);
+#ifdef TRY_MPROTECT
+	ASSIGN_DLSYM_IF_EXIST(mprotect);
+#endif
+
+	madvmerge_page_init();
+
+	if (sizeof(uintptr_t) > 32) {
+		madvmerge_madvise_mergeable_page_aligned(NULL + pagesize, (1ull << (40 - 1)) - pagesize);
+		madvmerge_madvise_mergeable_page_aligned(NULL + pagesize, (1ull << (48 - 1)) - pagesize);
+		madvmerge_madvise_mergeable_page_aligned(NULL + pagesize, (1ull << (64 - 1)) - pagesize);
+	} else {
+		madvmerge_madvise_mergeable_page_aligned(NULL + pagesize, (1ull << (32 - 1)) - pagesize);
+		madvmerge_madvise_mergeable_page_aligned(NULL + pagesize, (1ull << (32 - 1)) + (1ull << (32 - 2)) - pagesize);
+	}
 }
 
 void *malloc(size_t size)
@@ -164,8 +202,8 @@ void *sbrk(intptr_t increment)
 
 	COND_ASSIGN_DLSYM_OR_DIE(sbrk);
 	prev = libc_sbrk(increment);
-	if (increment > 0)
-		madvmerge_madvise_mergeable(prev, (intptr_t)prev + increment);
+	if (prev != MAP_FAILED && increment > 0)
+		madvmerge_madvise_mergeable(prev, increment);
 	return prev;
 }
 
@@ -199,21 +237,40 @@ void *mremap(void *oldaddr, size_t oldsize, size_t newsize, int flags, ...)
 	return ptr;
 }
 
-#if 0
+#ifdef TRY_CALLOC
+
+static /* __thread */ int madvmerge_count = 0;
+
+static char madvmerge_array[65536];
+
 void *calloc(size_t nmemb, size_t size)
 {
 	void *ptr;
-	size_t len = nmemb * size;
 
-	//COND_ASSIGN_DLSYM_OR_DIE(calloc);
-	COND_ASSIGN_DLSYM_OR_DIE(malloc);
-	ptr = libc_malloc(len);
-	if (ptr != NULL && nmemb != 0 && size != 0) {
-		memset(ptr, 0, len);
-		madvmerge_madvise_mergeable(ptr, len);
+	if (libc_calloc == NULL && madvmerge_count++ == 0) {
+		ptr = (nmemb * size > sizeof madvmerge_array) ? NULL : madvmerge_array;
+	} else {
+		COND_ASSIGN_DLSYM_OR_DIE(calloc);
+
+		ptr = libc_calloc(nmemb, size);
+		if (ptr != NULL)
+			madvmerge_madvise_mergeable(ptr, nmemb * size);
+
+#if 0
+		COND_ASSIGN_DLSYM_OR_DIE(malloc);
+
+		size_t len = nmemb * size;
+
+		ptr = libc_malloc(len);
+		if (ptr != NULL && nmemb != 0 && size != 0) {
+			memset(ptr, 0, len);
+			madvmerge_madvise_mergeable(ptr, len);
+		}
+#endif
 	}
 	return ptr;
 }
+
 #endif
 
 void *valloc(size_t size)
@@ -260,8 +317,9 @@ void *mmap2(void *addr, size_t len, int prot, int flags, int fd, off_t pgoffs)
 	return ptr;
 }
 
-#if 0
-int mprotect(const void *addr, size_t len, int prot)
+#ifdef TRY_MPROTECT
+
+int mprotect(void *addr, size_t len, int prot)
 {
 	int ret;
 
@@ -271,4 +329,6 @@ int mprotect(const void *addr, size_t len, int prot)
 		madvmerge_madvise_mergeable_page_aligned(addr, len);
 	return ret;
 }
+
 #endif
+

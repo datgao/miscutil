@@ -3,6 +3,7 @@
 asm*
 dbz*
 fat32*
+kira*
 resparse*
 stdansi*
 !*.c
