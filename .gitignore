@@ -7,3 +7,4 @@ kira*
 resparse*
 stdansi*
 !*.c
+!*.sh
