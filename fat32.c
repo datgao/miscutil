@@ -48,12 +48,33 @@
 
 #define FAT32_BOOTMBR_SIG	0xaa55
 #define FAT32_EOC		0x0fffffff
+#define FAT32_CLUSTER_BAD	0x0ffffff7
 
 // dirent initial char
 #define FAT32_DIRENT_SUB	0x05
 #define FAT32_DIRENT_DEL	0xe5
 #define FAT32_DIRENT_FREE	0x00
 #define FAT32_DIRENT_PAD	' '
+
+// short dirent
+#define F32BCH(c)		[(unsigned char)(c)] = 1
+
+static const char fat32_dirent_badch[] = {
+	F32BCH(0x00), F32BCH(0x01), F32BCH(0x02), F32BCH(0x03), F32BCH(0x04), F32BCH(0x05), F32BCH(0x06), F32BCH(0x07),
+	F32BCH(0x08), F32BCH(0x09), F32BCH(0x0a), F32BCH(0x0b), F32BCH(0x0c), F32BCH(0x0d), F32BCH(0x0e), F32BCH(0x0f),
+	F32BCH(0x10), F32BCH(0x11), F32BCH(0x12), F32BCH(0x13), F32BCH(0x14), F32BCH(0x15), F32BCH(0x16), F32BCH(0x17),
+	F32BCH(0x18), F32BCH(0x19), F32BCH(0x1a), F32BCH(0x1b), F32BCH(0x1c), F32BCH(0x1d), F32BCH(0x1e), F32BCH(0x1f),
+	F32BCH(' '),   /* '!' */    F32BCH('"'),  /* 0x22 < ch < 0x2a */
+	F32BCH('*'),  F32BCH('+'),  F32BCH(','),   /* '-' */    F32BCH('.'),  F32BCH('/'),  /* 0x2f < ch < 0x3a */
+	F32BCH(':'),  F32BCH(';'),  F32BCH('<'),  F32BCH('='),  F32BCH('>'),  F32BCH('?'),  /* 0x3f < ch < 0x5b */
+	F32BCH('['),  F32BCH('\\'), F32BCH(']'),  /* 0x5d < ch < 0x7c */
+	F32BCH('|'),    /* 0x7c < ch < 0xe5 */    F32BCH(0xe5),
+};
+
+static bool fat32_dirent_is_badch(unsigned char uch)
+{
+	return (fat32_dirent_badch[uch] != 0);
+}
 
 /*
 #define FAT32_DIRENT_BADCH(c)	((c) == '"' \
@@ -748,7 +769,7 @@ static int fat32_ext(int fd, unsigned blkstart, unsigned blkcount, struct fat32_
 		if ((fext->fe_logical % fm->fsblksz) != 0 || (fext->fe_physical % fm->fsblksz) != 0 || (fext->fe_length % fm->fsblksz) != 0
 		|| (fext->fe_flags & ~(FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_MERGED)) != 0) { fprintf(stderr, "Unexpected special or non-contiguous block\n"); goto fail; }
 
-		while (1) {
+		while (k < (int)blkcount) {
 			blk = blkstart + k;
 			phys = fext->fe_physical / fm->fsblksz;
 			offt = fext->fe_logical / fm->fsblksz;
@@ -820,58 +841,103 @@ static bool fat32_free(struct fat32_meta *fm)
 {
 	bool ret = true;
 
-	if (fm->ptr != MAP_FAILED && munmap(fm->ptr, fm->len) != 0) { perror("munmap()"); ret = false; }
+	if (fm->ptr != MAP_FAILED) {
+		if (msync(fm->ptr, fm->len, MS_SYNC) != 0) { perror("msync()"); ret = false; }
+		if (munmap(fm->ptr, fm->len) != 0) { perror("munmap()"); ret = false; }
+		fm->ptr = MAP_FAILED;
+	}
 
-	if (fm->fd >= 0 && close(fm->fd) != 0) { perror("close()"); ret = false; }
+	if (fm->fd >= 0) {
+		if (close(fm->fd) != 0) { perror("close()"); ret = false; }
+		fm->fd = -1;
+	}
 
 	return ret;
 }
 
 
 // pass path to link file blocks into FAT32
-static bool fat32_file(struct fat32_meta *fm, const char *filepath)
+static bool fat32_file(struct fat32_meta *fm, const char *fpath)
 {
 	bool ret = false;
-	int retblks, i, fd = -1;
-	unsigned blkcount, blk = 0, cluster = 0, first_cluster = 0;
+	char ch;
+	int retblks, i, fd = -1, slash = -1, dot = -1;
+	unsigned k, blkcount, blk = 0, cluster = 0, first_cluster = 0, fpathlen = strlen(fpath);
+	uint8_t *pfat = (uint8_t *)fm->ptr + fm->rsvd_sectors * fm->sector_size, *pdir = pfat + fm->fat_sectors * fm->sector_size;
+	struct fat32_dirent dirent = { 0 };
 	struct stat st;
 
-	fd = open(filepath, O_RDONLY);
+	fd = open(fpath, O_RDONLY);
 	if (fd < 0) { perror("open()"); goto fail; }
 
 	if (fstat(fd, &st) != 0) { perror("fstat()"); goto fail; }
 
-	if (st.st_dev != fm->devid) { fprintf(stderr, "Wrong mount point for file '%s'\n", filepath); goto fail; }
+	if (st.st_dev != fm->devid) { fprintf(stderr, "Wrong mount point for file '%s'\n", fpath); goto fail; }
 
-	if (S_ISDIR(st.st_mode)) { fprintf(stderr, "Skipping directory '%s'\n", filepath); goto success; }
+	if (S_ISDIR(st.st_mode)) { fprintf(stderr, "Skipping directory '%s'\n", fpath); goto success; }
 
-	if (!S_ISREG(st.st_mode)) { fprintf(stderr, "Not a regular file: '%s'\n", filepath); goto fail; }
+	if (!S_ISREG(st.st_mode)) { fprintf(stderr, "Not a regular file: '%s'\n", fpath); goto fail; }
 
-	if (st.st_size >= UINT32_MAX) { fprintf(stderr, "Oversized file '%s'\n", filepath); goto fail; }
+	if (st.st_size >= UINT32_MAX) { fprintf(stderr, "Oversized file '%s'\n", fpath); goto fail; }
 
-	if (fm->dbg && st.st_size == 0) fprintf(stderr, "Empty file '%s'\n", filepath);
+	if (fm->dbg && st.st_size == 0) fprintf(stderr, "Empty file '%s'\n", fpath);
 
 	for (blk = 0, blkcount = (st.st_size + fm->fsblksz - 1) / fm->fsblksz; blkcount > 0; blk += retblks, blkcount -= retblks) {
 		retblks = fat32_clusters(fd, blk, blkcount, fm);
 		if (retblks <= 0 || retblks > (int)blkcount) goto fail;
 
 		for (i = 0; i < retblks; i++) {
-			if (cluster != 0) fat32_wr32((uint8_t *)fm->ptr + fm->rsvd_sectors * fm->sector_size + cluster * sizeof(uint32_t), fm->blk[i]);
+			if (cluster != 0) fat32_wr32(pfat + cluster * sizeof(uint32_t), fm->blk[i]);
 			cluster = fm->blk[i];
 			if (first_cluster == 0) first_cluster = cluster;
 			if (fm->dbg) fprintf(stderr, "Got file block %u as cluster %u\n", blk + i, cluster);
 		}
 	}
 
-	if (cluster != 0) fat32_wr32((uint8_t *)fm->ptr + fm->rsvd_sectors * fm->sector_size + cluster * sizeof(uint32_t), FAT32_EOC);
+	if (cluster != 0) fat32_wr32(pfat + cluster * sizeof(uint32_t), FAT32_EOC);
 
-	if (first_cluster != 0) {
-		uint8_t *dirent = (uint8_t *)fm->ptr + (fm->rsvd_sectors + fm->fat_sectors) * fm->sector_size;
-		struct fat32_dirent *pde = (struct fat32_dirent *)dirent;
-		memcpy(pde->name, "zOMGWTF BBQ", sizeof pde->name);
-		fat32_wr16(&pde->clusthi, first_cluster >> 16);
-		fat32_wr16(&pde->clustlo, first_cluster);
-		fat32_wr16(&pde->filesz, st.st_size);
+	dirent.name[0] = '_';
+	memset(dirent.name + 1, ' ', sizeof dirent.name - 1);
+	dirent.attr = FAT32_ATTR_RO;
+	fat32_wr16(&dirent.clusthi, first_cluster >> 16);
+	fat32_wr16(&dirent.clustlo, first_cluster);
+	fat32_wr32(&dirent.filesz, st.st_size);
+
+	for (k = 0; k < fpathlen && (slash < 0 || dot < 0); k++) {
+		i = fpathlen - 1 - k;
+		switch (fpath[i]) {
+		case '/':
+			if (slash < 0) slash = i;
+			break;
+		case '.':
+			if (dot < 0) dot = i;
+			break;
+		default:
+			break;
+		}
+	}
+
+	for (k = 0, i = slash + 1; k < 8 && i > 0 && i < (int)fpathlen; i++) {
+		ch = fpath[i];
+		if (ch == '/' || ch == '.') break;
+		if (fat32_dirent_is_badch(ch)) continue;
+		if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
+		dirent.name[k++] = ch;
+	}
+
+	for (k = 8, i = dot + 1; k < 11 && i > 0 && i < (int)fpathlen; i++) {
+		ch = fpath[i];
+		if (ch == '/' || ch == '.') break;
+		if (fat32_dirent_is_badch(ch)) continue;
+		if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
+		dirent.name[k++] = ch;
+	}
+
+	for (k = 0; k < fm->root_dir_clusters * fm->sector_size; k += sizeof dirent, pdir += sizeof dirent) {
+		if (*pdir == FAT32_DIRENT_FREE) {
+			memcpy(pdir, &dirent, sizeof dirent);
+			break;
+		}
 	}
 
 success:
@@ -928,9 +994,9 @@ fail:
 static bool fat32_prepend(struct fat32_meta *fm, const char *devpath, const char *mntpath, const char *partdev)
 {
 	bool ret = false;
-	int fatpte, cluster_sectors = 8;
-	unsigned extfs[2] = { 0 };
-	uint8_t buf[FAT32_MS * 3] = { 0 };
+	int fatpte;
+	unsigned i, k, cluster_sectors = 8, extfs[2] = { 0 };
+	uint8_t *pfat, buf[FAT32_MS * 3] = { 0 };
 	ssize_t rlen;
 	size_t len = 0;
 	char *line = NULL;
@@ -941,7 +1007,7 @@ static bool fat32_prepend(struct fat32_meta *fm, const char *devpath, const char
 	fatpte = fat32_mbr(fm, buf, extfs);
 	if (fatpte < 0) goto fail;
 
-	// TODO: set this in sb with fsblksz from prep
+	// TODO: set this in sb with fsblksz from prep - must fix logic that assumes: fsblksz == cluster_sectors * sector_size
 	if ((extfs[0] % cluster_sectors) != 0) cluster_sectors = 1;
 	fm->cluster_sectors = cluster_sectors;
 
@@ -961,15 +1027,24 @@ static bool fat32_prepend(struct fat32_meta *fm, const char *devpath, const char
 
 	if (!fat32_map(fm)) goto fail;		// memory map FAT32 metadata regions
 
-	memset(fm->ptr + fm->rsvd_sectors * fm->sector_size, 0, (fm->fat_sectors + (fm->root_dir_clusters * fm->cluster_sectors)) * fm->sector_size);
+	pfat = (uint8_t *)fm->ptr + fm->rsvd_sectors * fm->sector_size;
+	memset(pfat, 0, (fm->fat_sectors + fm->root_dir_clusters * fm->cluster_sectors) * fm->sector_size);
 
-	fat32_wr32((uint8_t *)fm->ptr + fm->rsvd_sectors * fm->sector_size + fm->start_cluster * sizeof(uint32_t), FAT32_EOC);
+	for (i = 0; i < fm->root_dir_clusters - 1; i++) {
+		k = fm->start_cluster + i;
+		fat32_wr32(pfat + k * sizeof(uint32_t), k + 1);
+	}
+	fat32_wr32(pfat + (fm->start_cluster + i) * sizeof(uint32_t), FAT32_EOC);
 
 	while ((rlen = getline(&line, &len, stdin)) >= 0) {
 		if (rlen > 0 && line[rlen - 1] == '\n') line[--rlen] = '\0';
 		if (rlen > 0 && line[rlen - 1] == '\r') line[--rlen] = '\0';
 		if (rlen == 0) continue;
 		if (!fat32_file(fm, line)) goto fail;	// add file from mounted path
+	}
+
+	for (i = 0; i < fm->fat_sectors * fm->sector_size; i += sizeof(uint32_t), pfat += sizeof(uint32_t)) {
+		if (fat32_rd32(pfat) == 0) fat32_wr32(pfat, FAT32_CLUSTER_BAD);
 	}
 
 success:

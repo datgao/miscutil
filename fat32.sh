@@ -82,7 +82,7 @@ unmountfs() {
 }
 
 fat32magic() {
-	local f g m p s t u r x
+	local f g m p s t u w r x
 	m="$1" && f="$2" && g="$3" && p="$4" && s="$5" && r="$6"
 	echo "'$m'/"
 	blockdev --getsz "$g"
@@ -96,13 +96,15 @@ fat32magic() {
 	# do not make sparse: truncate -s 12345 "$t"
 	# dd if=/dev/zero bs=12345 count=1 of="$t"
 	t="$m/fat32.c"
+	w="$m/asm.c"
 	cp -nv fat32.c "$t"
+	cp -nv asm.c "$w"
 	echo
 	# strace -fx ''
-	"$x" -m "$m" -d "$g" -p "$f" -g < <(echo "$t")
-	printf '\n%s\n\n' "'$?'"
+	gdb -ex run -ex bt -ex q -ex y --args "$x" -m "$m" -d "$g" -p "$f" -g < <(printf '%s\n' "$t" "$w")
+	printf '%s\n\n' "'$?'"
 	dosfsck -rfv "$g" < <(printf '%s\n' "1" "y")
-	printf '\n%s\n\n' "'$?'"
+	printf '%s\n\n' "'$?'"
 }
 
 fnmain() {
@@ -132,13 +134,21 @@ fnmain() {
 		t="/srv"
 		mount "$g" "$t"
 		ls -akls "$t"
-		w="$t/FSCK0000.REC" && [[ -e "$w" ]] || ! w="$t/zOMGWTF.BBQ" || e="1"
+		echo
+		w="$t/FSCK0000.REC" && [[ -e "$w" ]] || ! w="$t/FAT32.C" || e="1"
 		cp -v "$w" /tmp/
+		echo
 		diff -sq fat32.c "$w"
-		printf '\n%s\n\n' "'$?'"
-		if [[ ! "$e" ]] ; then tr -d '\000' < "$w" | diff -sq - fat32.c ; printf '\n%s\n\n' "'$?'" ; fi
+		printf '%s\n\n' "'$?'"
+		diff -sq asm.c "$t/asm.c"
+		printf '%s\n\n' "'$?'"
+		if [[ ! "$e" ]] ; then tr -d '\000' < "$w" | diff -sq - fat32.c ; printf '%s\n\n' "'$?'" ; fi
+		df -h | grep -E '[ \t]/(mnt|srv)$'
+		echo
 		umount "$t"
 	fi
+
+	grep -HnF '' "/sys/block/${z##*/}"/{orig_data_size,compr_data_size,mem_used_total,zero_pages,comp_algorithm}
 
 	[[ ! "$m" ]] || unmountfs "$m" || r="$?"
 	[[ ! "$f" ]] || resetloop "$f" || r="$?"
