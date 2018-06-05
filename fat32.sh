@@ -101,7 +101,8 @@ fat32magic() {
 	cp -nv asm.c "$w"
 	echo
 	# strace -fx ''
-	gdb -ex run -ex bt -ex q -ex y --args "$x" -m "$m" -d "$g" -p "$f" -g < <(printf '%s\n' "$t" "$w")
+	time "$x" -m "$m" -d "$g" -p "$f" -g < <(printf '%s\n' "$t" "$w")
+	# time gdb -ex run -ex bt -ex q -ex y --args "$x" -m "$m" -d "$g" -p "$f" -g < <(printf '%s\n' "$t" "$w")
 	printf '%s\n\n' "'$?'"
 	dosfsck -rfv "$g" < <(printf '%s\n' "1" "y")
 	printf '%s\n\n' "'$?'"
