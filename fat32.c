@@ -25,7 +25,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
-#include <linux/fs.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -34,18 +33,18 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-#if defined(linux) && !defined(NO_EXTENT_MAP)
+#include <linux/fs.h>
+#if !defined(NO_EXTENT_MAP) && defined(FS_IOC_FIEMAP)
+#include <linux/fiemap.h>
 #define TRY_EXTENT_MAP
 #endif
-
-#ifdef TRY_EXTENT_MAP
-#include <linux/fiemap.h>
-#endif
-
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(a)	(sizeof (a) / sizeof *(a))
 #endif
+
+#define FAT32_BS		512		// min sector size
+#define FAT32_MS		4096		// max sector size
 
 #define FAT32_BOOTMBR_SIG	0xaa55
 #define FAT32_CLUSTER_FREE	0
@@ -57,46 +56,6 @@
 #define FAT32_DIRENT_DEL	0xe5
 #define FAT32_DIRENT_FREE	0x00
 #define FAT32_DIRENT_PAD	' '
-
-// short dirent
-#define F32BCH(c)		[(unsigned char)(c)] = 1
-#define CMD_NCH			(1 << 8)
-
-static const char fat32_dirent_badch[CMD_NCH] = {
-	F32BCH(0x00), F32BCH(0x01), F32BCH(0x02), F32BCH(0x03), F32BCH(0x04), F32BCH(0x05), F32BCH(0x06), F32BCH(0x07),
-	F32BCH(0x08), F32BCH(0x09), F32BCH(0x0a), F32BCH(0x0b), F32BCH(0x0c), F32BCH(0x0d), F32BCH(0x0e), F32BCH(0x0f),
-	F32BCH(0x10), F32BCH(0x11), F32BCH(0x12), F32BCH(0x13), F32BCH(0x14), F32BCH(0x15), F32BCH(0x16), F32BCH(0x17),
-	F32BCH(0x18), F32BCH(0x19), F32BCH(0x1a), F32BCH(0x1b), F32BCH(0x1c), F32BCH(0x1d), F32BCH(0x1e), F32BCH(0x1f),
-	F32BCH(' '),   /* '!' */    F32BCH('"'),  /* 0x22 < ch < 0x2a */
-	F32BCH('*'),  F32BCH('+'),  F32BCH(','),   /* '-' */    F32BCH('.'),  F32BCH('/'),  /* 0x2f < ch < 0x3a */
-	F32BCH(':'),  F32BCH(';'),  F32BCH('<'),  F32BCH('='),  F32BCH('>'),  F32BCH('?'),  /* 0x3f < ch < 0x5b */
-	F32BCH('['),  F32BCH('\\'), F32BCH(']'),  /* 0x5d < ch < 0x7c */
-	F32BCH('|'),    /* 0x7c < ch <= 0xff */
-};
-
-static bool fat32_dirent_is_badch(unsigned char uch)
-{
-	return (fat32_dirent_badch[uch] != 0);
-}
-
-/*
-#define FAT32_DIRENT_BADCH(c)	((c) == '"' \
-				|| ((c) >= 0x2a && (c) <= 0x2f && (c) != 0x2d) \
-				|| ((c) >= 0x3a && (c) <= 0x3f) \
-				|| ((c) >= 0x5b && (c) <= 0x5d) \
-				|| (c) == 0x7c)
-*/
-
-// allow for LFN but not short: + , ; = [ ]
-#define FAT32_LFN_BADCH(c)	((c) == '"' || (c) == '*' || (c) == '/' \
-				|| (c) == ':' || (c) == '<' || (c) == '>' \
-				|| (c) == '?' || (c) == '\\' || (c) == '|')
-// allow: letters, digits, >127, and: $ % ' - _ @ ~ ` ! ( ) { } ^ # & -- disallows '.' ???
-#define FAT32_DIRENT_BADCH(c)	(FAT32_LFN_BADCH(c) || (c) == '+' \
-				|| (c) == ',' || (c) == '.' || (c) == ';' \
-				(c) == '=' || (c) == '[' || (c) == ']')
-// duplicates must not exist across both long and short namespaces
-// long name becomes invalid if short name exists
 
 // dirent attributes
 #define FAT32_ATTR_RO		0x01
@@ -124,7 +83,7 @@ static bool fat32_dirent_is_badch(unsigned char uch)
 #define FAT32_TM_HR_BITS	5
 #define FAT32_TM_HR_SHIFT	(FAT32_TM_MIN_BITS + FAT32_TM_MIN_SHIFT)
 
-struct fat32_dirent {			// short dirent
+struct fat32_dirent {				// short dirent
 	uint8_t		name[11];
 	uint8_t		attr;
 	uint8_t		resvnt;
@@ -139,27 +98,31 @@ struct fat32_dirent {			// short dirent
 	uint32_t	filesz;
 };
 
+// duplicates must not exist across both long and short namespaces
+// long name becomes invalid if short name exists
+
 #define FAT32_LFN_ORD_LAST	0x40
 
-struct fat32_lfnent {			// unused chars: 0x0000 terminate then 0xffff fill
-	uint8_t		ord;		// sequence: ORD_LAST | n, n - 1, ..., 1, short entry
-	uint8_t		name1[10];	// chars 1-5
+struct fat32_lfnent {				// unused chars: 0x0000 terminate then 0xffff fill
+	uint8_t		ord;			// sequence: ORD_LAST | n, n - 1, ..., 1, short entry
+	uint8_t		name1[10];		// chars 1-5
 	uint8_t		attr;
-	uint8_t		type;		// zero - other values reserved
+	uint8_t		type;			// zero - other values reserved
 	uint8_t		cksum;
-	uint8_t		name2[12];	// chars 6-11
-	uint16_t	clustlo;	// zero
-	uint8_t		name3[4];	// chars 12-13
+	uint8_t		name2[12];		// chars 6-11
+	uint16_t	clustlo;		// zero
+	uint8_t		name3[4];		// chars 12-13
 };
 
-struct fat32_em {			// one extent mapped from logical file to FS partition
+
+struct fat32_em {				// one extent mapped from logical file to FS partition
 	unsigned	len;
-	unsigned	logical;	// block within file
-	unsigned	physical;	// corresponding block relative to FS partition
+	unsigned	logical;		// block within file
+	unsigned	physical;		// corresponding block relative to FS partition
 };
 
-#define FAT32_EXTENT_BATCH	4096	// for max 4 GB-1 file and typical 4 KB FS blocks, batching by 4096 needs only 256 syscalls
-#define FAT32_BATCH_CLUSTER	256	// smaller values will use extent cache when possible
+#define FAT32_EXTENT_BATCH	4096		// only one syscall if avg fragment size in blocks, for 4GB-1 file and FS block of 4 KB
+#define FAT32_BATCH_CLUSTER	256		// independent values esp. smaller will use extent cache when possible
 
 struct fat32_meta {
 	int		fd;			// block device
@@ -197,11 +160,56 @@ struct fat32_meta {
 };
 
 
-#define FAT32_BS	512		// minimum sector size
-const unsigned fat32_bs = FAT32_BS;
+#define CMD_NCH			(1 << 8)
 
-#define FAT32_MS	4096		// maximum sector size - TODO: could support 32768 but unlikely for non-FAT FS
-const unsigned fat32_ms = FAT32_MS;
+#define F32BCH(c)		[(unsigned char)(c)] = 1	// short dirent - but valid for long name
+#define F32BCH_(c)		[(unsigned char)(c)] = -1	// long name - also invalid for short name
+
+static const signed char fat32_dirent_badch[CMD_NCH] = {
+	F32BCH_(0x00), F32BCH_(0x01), F32BCH_(0x02), F32BCH_(0x03), F32BCH_(0x04), F32BCH_(0x05), F32BCH_(0x06), F32BCH_(0x07),
+	F32BCH_(0x08), F32BCH_(0x09), F32BCH_(0x0a), F32BCH_(0x0b), F32BCH_(0x0c), F32BCH_(0x0d), F32BCH_(0x0e), F32BCH_(0x0f),
+	F32BCH_(0x10), F32BCH_(0x11), F32BCH_(0x12), F32BCH_(0x13), F32BCH_(0x14), F32BCH_(0x15), F32BCH_(0x16), F32BCH_(0x17),
+	F32BCH_(0x18), F32BCH_(0x19), F32BCH_(0x1a), F32BCH_(0x1b), F32BCH_(0x1c), F32BCH_(0x1d), F32BCH_(0x1e), F32BCH_(0x1f),
+	F32BCH(' '),     /* '!' */    F32BCH_('"'),    /* 0x22 < ch < 0x2a */
+	F32BCH_('*'),  F32BCH('+'),   F32BCH(','),     /* '-' */    F32BCH('.'),   F32BCH_('/'),    /* 0x2f < ch < 0x3a */
+	F32BCH_(':'),  F32BCH(';'),   F32BCH_('<'),  F32BCH('='),   F32BCH_('>'),  F32BCH_('?'),    /* 0x3f < ch < 0x5b */
+	F32BCH('['),   F32BCH_('\\'), F32BCH(']'),     /* 0x5d < ch < 0x7c */
+	F32BCH_('|'),    /* 0x7c < ch <= 0xff */
+};
+
+static bool fat32_badch_dirent(unsigned char uch)
+{
+	return (fat32_dirent_badch[uch] != 0);
+}
+
+#if 0
+
+static bool fat32_badch_lfn(unsigned char uch)
+{
+	return (fat32_dirent_badch[uch] < 0);
+}
+
+#endif
+
+
+enum fat32_level {
+	FAT32_LOG_FATAL,
+	FAT32_LOG_ERROR,
+	FAT32_LOG_WARN,
+	FAT32_LOG_NOTICE,
+	FAT32_LOG_INFO,
+	FAT32_LOG_DEBUG,
+	FAT32_LOG_LEVELS
+};
+
+static const char *const fat32_level_pfx[FAT32_LOG_LEVELS] = {
+	[FAT32_LOG_FATAL]	= "Fatal",
+	[FAT32_LOG_ERROR]	= "Error",
+	[FAT32_LOG_WARN]	= "Warning",
+	[FAT32_LOG_NOTICE]	= "Notice",
+	[FAT32_LOG_INFO]	= "Info",
+	[FAT32_LOG_DEBUG]	= "Debug",
+};
 
 
 static int fat32_vsnprintf(char *buf, int size, int pos, const char *fmt, va_list ap)
@@ -238,25 +246,6 @@ static int printf_like(4,5) fat32_snprintf(char *buf, int size, int pos, const c
 	va_end(ap);
 	return ret;
 }
-
-enum fat32_level {
-	FAT32_LOG_FATAL,
-	FAT32_LOG_ERROR,
-	FAT32_LOG_WARN,
-	FAT32_LOG_NOTICE,
-	FAT32_LOG_INFO,
-	FAT32_LOG_DEBUG,
-	FAT32_LOG_LEVELS
-};
-
-static const char *const fat32_level_pfx[FAT32_LOG_LEVELS] = {
-	[FAT32_LOG_FATAL]	= "Fatal",
-	[FAT32_LOG_ERROR]	= "Error",
-	[FAT32_LOG_WARN]	= "Warning",
-	[FAT32_LOG_NOTICE]	= "Notice",
-	[FAT32_LOG_INFO]	= "Info",
-	[FAT32_LOG_DEBUG]	= "Debug",
-};
 
 static void fat32_log(int level, const char *fmt, ...)
 {
@@ -335,7 +324,7 @@ static bool fat32_has_sig(const void *b, unsigned sector_size)
 
 static void fat32_write_sig(void *b, unsigned sector_size)
 {
-	fat32_wr16((uint8_t *)b + fat32_bs - 2, FAT32_BOOTMBR_SIG);
+	fat32_wr16((uint8_t *)b + FAT32_BS - 2, FAT32_BOOTMBR_SIG);
 	fat32_wr16((uint8_t *)b + sector_size - 2, FAT32_BOOTMBR_SIG);
 }
 
@@ -437,97 +426,6 @@ fail:
 }
 
 
-
-// ===== ===== ===== BEGIN : skip LFN for now ===== ===== =====
-
-
-
-#if 0
-
-// compute checksum from short name to place in long entries
-static uint8_t fat32_cksum_short(const struct fat32_dirent *dnt)
-{
-	unsigned nch = sizeof dnt->name;
-	const uint8_t *ptr = dnt->name;
-	uint8_t sum = 0;
-
-	do {
-		sum = ((sum & 0x01) << 7) + (sum >> 1) + *ptr++;	// rotate right + byte
-	} while (--nch != 0);
-
-	return sum;
-}
-
-
-// short or LFN - don't pass Unicode bytes or deleted or Kanji substituted entries
-static bool fat32_badch(uint8_t ch, bool lfn)
-{
-	bool ret = false;
-
-	if (ch < 0x20 || ch >= 0x7f) goto fail;	// rejects NUL bytes incl. Unicode, or extended set until UTF-8 and Unicode aware
-
-	switch (ch) {
-	case '+':
-	case ',':
-	//case '.':
-	case ';':
-	case '=':
-	case '[':
-	case ']':
-		if (lfn) break;
-		// fall through
-	case '"':
-	case '*':
-	case '/':
-	case ':':
-	case '<':
-	case '>':
-	case '?':
-	case '\\':
-	case '|':
-		goto fail;
-	default:
-		break;
-	}
-
-out:
-	return ret;
-fail:
-	ret = true;
-	goto out;
-}
-
-
-// lfn must be NUL terminated, and basis buffer must hold 11 bytes and will not be terminated
-static unsigned fat32_lfn_basis(uint8_t *basis, const uint8_t *lfn)
-{
-	unsigned ret = 0, pos = 0;
-	uint8_t ch;
-	const uint8_t *str = lfn;
-
-	if (*str == '\0') goto fail;
-
-	while ((ch = *str) != '\0') {
-		if (fat32_badch(ch)) goto fail;
-		if (pos == 0 && (ch == ' ' || ch == '.')) continue;	// skip leading spaces and periods
-		if (ch >= 'a' || ch <= 'z')
-			ch -= 'a' - 'A';
-		basis[pos] = ch;
-		if (++pos >= 11) goto fail;
-	}
-
-fail:
-	return ret;
-}
-
-#endif
-
-
-
-// ===== ===== ===== END : skip LFN for now ===== ===== =====
-
-
-
 // pass PT entry to fetch partition offset and size - error if not: empty, Linux EXT2/3/4, or FAT32 with BS/MBR
 static bool fat32_pt(const uint8_t *buf, unsigned extpt[2])
 {
@@ -604,7 +502,7 @@ static int fat32_mbr(struct fat32_meta *fm, uint8_t *buf, unsigned extfs[2])
 		goto fail;			// success
 	}
 
-	if (!fat32_has_sig(buf, fat32_bs) || !fat32_has_sig(buf, fm->sector_size)) {
+	if (!fat32_has_sig(buf, FAT32_BS) || !fat32_has_sig(buf, fm->sector_size)) {
 		fat32_log(FAT32_LOG_FATAL, "missing MBR signature");
 		goto fail;
 	}
@@ -653,7 +551,7 @@ static bool fat32_sb(struct fat32_meta *fm, uint8_t *buf, unsigned extfs[2], uns
 		rsvd_sectors = overlap_start_sector - root_dir_sectors - fat_sectors;
 		fat32_log(FAT32_LOG_INFO, "creating FAT32 FS: rsvd = %u, FAT = %u, root = %u, data = # %u @ %u", rsvd_sectors, fat_sectors, root_dir_clusters, cluster_count, overlap_start_sector);
 	} else {
-		if (fat32_has_sig(buf, fat32_bs) || fat32_has_sig(buf, fm->sector_size)) { fat32_log(FAT32_LOG_FATAL, "unexpected MBR/BS signature"); goto fail; }
+		if (fat32_has_sig(buf, FAT32_BS) || fat32_has_sig(buf, fm->sector_size)) { fat32_log(FAT32_LOG_FATAL, "unexpected MBR/BS signature"); goto fail; }
 		if ((buf[0] == 0xe9 || (buf[0] == 0xeb && buf[2] == 0x90))
 		&& buf[0x0b] == (sector_size & 0xff) && buf[0x0c] == (sector_size >> 8)
 		&& (buf[0x0e] != 0 || buf[0x0f] != 0)
@@ -736,10 +634,12 @@ static bool fat32_sb(struct fat32_meta *fm, uint8_t *buf, unsigned extfs[2], uns
 	*ptr++ = 'r';
 	*ptr++ = 'A';
 	*ptr++ = 'a';
+#if 0
 	*ptr++ = 0xff;	// -1 = unknown free clusters
 	*ptr++ = 0xff;
 	*ptr++ = 0xff;
 	*ptr++ = 0xff;
+#endif
 
 success:
 	if (!writeall(fm->fd, buf, min_rsvd * sector_size, fm)) goto fail;
@@ -769,7 +669,7 @@ static bool fat32_prep(struct fat32_meta *fm, const char *mntpath, const char *p
 
 	if (ioctl(fd, FIGETBSZ, &fm->fsblksz) != 0) { perror("ioctl(FIGETBSZ"); goto fail; }
 
-	if (fm->fsblksz < fat32_bs || fm->fsblksz > FAT32_MS || ((fm->fsblksz - 1) & fm->fsblksz) != 0) {	// too small/large or not power of 2
+	if (fm->fsblksz < FAT32_BS || fm->fsblksz > FAT32_MS || ((fm->fsblksz - 1) & fm->fsblksz) != 0) {	// too small/large or not power of 2
 		fat32_log(FAT32_LOG_FATAL, "unsupported FS block size %u", fm->fsblksz);
 		goto fail;
 	}
@@ -838,7 +738,7 @@ static int fat32_ext(int fd, unsigned blkstart, unsigned blkcount, struct fat32_
 	struct fiemap_extent *fext;
 	union {
 		struct fiemap emap;
-		char arr[sizeof *emap + blkcount * sizeof *emap->fm_extents];
+		char arr[sizeof *emap + ARRAY_SIZE(fm->ext_arr) * sizeof *emap->fm_extents];
 	} umap;
 
 	if (fm->ext_num != 0 && fm->ext_arr[fm->ext_idx].logical != blkstart) fm->ext_num = 0;
@@ -847,18 +747,24 @@ static int fat32_ext(int fd, unsigned blkstart, unsigned blkcount, struct fat32_
 		fm->ext_idx = 0;
 		memset(&umap, 0, sizeof umap);
 		emap = &umap.emap;
-		emap->fm_start = blkstart * fm->fsblksz;
-		emap->fm_length = blkcount * fm->fsblksz;
+		emap->fm_start = blkstart * (unsigned long long)fm->fsblksz;
+		emap->fm_length = blkcount * (unsigned long long)fm->fsblksz;
 		emap->fm_flags = FIEMAP_FLAG_SYNC;
 		emap->fm_mapped_extents = 0;
 		emap->fm_extent_count = ARRAY_SIZE(fm->ext_arr);
 
+#ifdef FS_IOC_FIEMAP
 		if (ioctl(fd, FS_IOC_FIEMAP, emap) != 0) {
-			if (fm->extmap) { perror("ioctl(FS_IOC_FIEMAP)"); goto fail; }
+			perror("ioctl(FS_IOC_FIEMAP)");
+#else
+			fat32_log(FAT32_LOG_INFO, "build could not include extent mapping");
+#endif
+			if (fm->extmap) goto fail;
 			fm->extmap = true;
 			ret = 0;
 			goto fail;
 		}
+
 		fm->extmap = true;
 
 		if (fm->dbg) fat32_log(FAT32_LOG_DEBUG, "batched %u from %u of %u extents at %u", (unsigned)emap->fm_mapped_extents, (unsigned)emap->fm_extent_count, blkcount, blkstart);
@@ -876,8 +782,8 @@ static int fat32_ext(int fd, unsigned blkstart, unsigned blkcount, struct fat32_
 		}
 	}
 
-	for (k = 0, i = fm->ext_idx, pext = fm->ext_arr + i; k < ARRAY_SIZE(fm->cluster) && i < fm->ext_idx + fm->ext_num; i++, pext++) {
-		while (true) {
+	for (k = 0, i = fm->ext_idx, pext = fm->ext_arr + i; i < fm->ext_idx + fm->ext_num; i++, pext++) {
+		while (k < ARRAY_SIZE(fm->cluster)) {
 			if (pext->logical + pext->len < blkstart) { fat32_log(FAT32_LOG_FATAL, "unexpected end of extent"); goto fail; }
 			adj = blkstart - pext->logical;
 			pext->physical += adj;
@@ -886,6 +792,7 @@ static int fat32_ext(int fd, unsigned blkstart, unsigned blkcount, struct fat32_
 			pext->logical = blkstart++;
 			fm->cluster[k++] = pext->physical + fm->start_cluster + fm->root_dir_clusters;
 		}
+		if (k >= ARRAY_SIZE(fm->cluster)) break;
 	}
 	fm->ext_num -= i - fm->ext_idx;
 	fm->ext_idx = i;
@@ -909,6 +816,7 @@ static int fat32_clusters(int fd, unsigned blkstart, unsigned blkcount, struct f
 		ret = fat32_ext(fd, blkstart, blkcount, fm);
 		if (ret != 0) goto fail;	// clusters > 0, or failed < 0
 		fm->blkmap = true;		// fallback to block mapping and try below
+		fat32_log(FAT32_LOG_INFO, "extent mapping attempt failed, fallback to block mapping");
 	}
 	if (!fm->blkmap) goto fail;
 #endif
@@ -956,9 +864,6 @@ static bool fat32_free(struct fat32_meta *fm)
 }
 
 
-//#define FAT32_REPEAT(n, ...)	FAT32_REPEAT((n) - 1, __VA_ARGS__)
-
-
 static void fat32_dirent_short_part(struct fat32_dirent *dirent, unsigned idx, unsigned len, const char *fpath, unsigned fpathlen, unsigned pos)
 {
 	char ch;
@@ -966,12 +871,54 @@ static void fat32_dirent_short_part(struct fat32_dirent *dirent, unsigned idx, u
 	while (idx < len && pos > 0 && pos < fpathlen) {
 		ch = fpath[pos++];
 		if (ch == '/' || ch == '.') break;
-		if (fat32_dirent_is_badch(ch)) continue;
+		if (fat32_badch_dirent(ch)) continue;
 		if (ch == (char)FAT32_DIRENT_DEL) ch = FAT32_DIRENT_SUB;
 		if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
 		dirent->name[idx++] = ch;
 	}
 }
+
+
+#if 0
+
+// compute checksum from short name to place in long entries
+static uint8_t fat32_cksum_short(const struct fat32_dirent *dnt)
+{
+	unsigned nch = sizeof dnt->name;
+	const uint8_t *ptr = dnt->name;
+	uint8_t sum = 0;
+
+	do {
+		sum = ((sum & 0x01) << 7) + (sum >> 1) + *ptr++;	// rotate right + byte
+	} while (--nch != 0);
+
+	return sum;
+}
+
+
+// lfn must be NUL terminated, and basis buffer must hold 11 bytes and will not be terminated
+static unsigned fat32_lfn_basis(uint8_t *basis, const uint8_t *lfn)
+{
+	unsigned ret = 0, pos = 0;
+	uint8_t ch;
+	const uint8_t *str = lfn;
+
+	if (*str == '\0') goto fail;
+
+	while ((ch = *str++) != '\0') {
+		if (fat32_badch_lfn(ch)) goto fail;
+		if (pos == 0 && (ch == ' ' || ch == '.')) continue;	// skip leading spaces and periods
+		if (ch == (char)FAT32_DIRENT_DEL) ch = FAT32_DIRENT_SUB;
+		if (ch >= 'a' || ch <= 'z') ch -= 'a' - 'A';
+		basis[pos] = ch;
+		if (++pos >= 11) goto fail;
+	}
+
+fail:
+	return ret;
+}
+
+#endif
 
 
 // pass path to link file blocks into FAT32
@@ -995,11 +942,13 @@ static bool fat32_file(struct fat32_meta *fm, const char *fpath)
 
 	if (!S_ISREG(st.st_mode)) { fat32_log(FAT32_LOG_FATAL, "not a regular file: '%s'", fpath); goto fail; }
 
-	if (st.st_size >= UINT32_MAX) { fat32_log(FAT32_LOG_FATAL, "oversized file '%s'", fpath); goto fail; }
+	if (st.st_size > UINT32_MAX) { fat32_log(FAT32_LOG_FATAL, "oversized file '%s'", fpath); goto fail; }
 
 	if (fm->dbg && st.st_size == 0) fat32_log(FAT32_LOG_DEBUG, "empty file '%s'", fpath);
 
+#ifdef TRY_EXTENT_MAP
 	fm->ext_num = 0;
+#endif
 	for (blk = 0, blkcount = (st.st_size + fm->cluster_size - 1) / (fm->cluster_size); blkcount > 0; blk += retblks, blkcount -= retblks) {
 		retblks = fat32_clusters(fd, blk, blkcount, fm);
 		if (retblks <= 0 || retblks > (int)blkcount) goto fail;
@@ -1069,14 +1018,14 @@ static unsigned fat32_open(struct fat32_meta *fm, const char *devpath)
 	if (!S_ISBLK(st.st_mode)) {
 		if (S_ISREG(st.st_mode)) { fat32_log(FAT32_LOG_FATAL, "not a block device node"); goto fail; }
 		fat32_log(FAT32_LOG_INFO, "Operating on regular file as block device");
-		sectsz = fat32_bs;	// FIXME: allow override e.g. 4096
+		sectsz = FAT32_BS;	// FIXME: allow override e.g. 4096
 		if (st.st_size % sectsz != 0) { fat32_log(FAT32_LOG_FATAL, "file size is not multiple of sector size"); goto fail; }
 		devsz = st.st_size;
 	}
 
 	if (sectsz == 0) {
 		if (ioctl(fm->fd, BLKSSZGET, &sectsz) != 0) { perror("ioctl(BLKSSZGET)"); goto fail; }
-		if (sectsz < fat32_bs || sectsz > FAT32_MS || ((sectsz - 1) & sectsz) != 0) {	// too small/large or not power of 2
+		if (sectsz < FAT32_BS || sectsz > FAT32_MS || ((sectsz - 1) & sectsz) != 0) {	// too small/large or not power of 2
 			fat32_log(FAT32_LOG_FATAL, "unsupported sector size %u", sectsz);
 			goto fail;
 		}
@@ -1178,6 +1127,7 @@ fail:
  * 
  */
 
+#define CMDOPT_BLKMAP		'b'	// force block mapping instead of trying extent mapping
 #define CMDOPT_DEVPATH		'd'	// string
 #define CMDOPT_DBGMSG		'g'
 #define CMDOPT_HEXDUMP		'h'
@@ -1209,6 +1159,7 @@ static int fat32_getopt(int argc, char *const argv[], const char *argopt[CMD_NCH
 	bool ret = false;
 	int nerr = 0, opt;
 	const char *const msgopt[CMD_NCH] = {
+		CMD_IDX(CMDOPT_BLKMAP)	= "force block map",
 		CMD_IDX(CMDOPT_DEVPATH)	= "device path",
 		CMD_IDX(CMDOPT_MNTPATH)	= "mount path",
 		CMD_IDX(CMDOPT_PARTDEV) = "mounted partition",
@@ -1217,6 +1168,7 @@ static int fat32_getopt(int argc, char *const argv[], const char *argopt[CMD_NCH
 		CMD_IDX(CMDOPT_TESTRDZ)	= "fake read zeroes",
 	};
 	const char *const stropt = CMD_CH_STR('+',	// stop at first non-option
+				CMDOPT_BLKMAP,
 				CMD_ARG_REQ(CMDOPT_DEVPATH),
 				CMD_ARG_REQ(CMDOPT_MNTPATH),
 				CMD_ARG_REQ(CMDOPT_PARTDEV),
@@ -1224,6 +1176,7 @@ static int fat32_getopt(int argc, char *const argv[], const char *argopt[CMD_NCH
 				CMDOPT_HEXDUMP,
 				CMDOPT_TESTRDZ);
 	const int reqarg[CMD_NCH] = {
+		CMD_IDX(CMDOPT_BLKMAP)	= CMD_REQ_NOOPT_NOARG,
 		CMD_IDX(CMDOPT_DEVPATH)	= CMD_REQ_OPT_ARG,
 		CMD_IDX(CMDOPT_MNTPATH)	= CMD_REQ_OPT_ARG,
 		CMD_IDX(CMDOPT_PARTDEV)	= CMD_REQ_NOOPT_ARG,
@@ -1296,6 +1249,10 @@ int main(int argc, char *argv[])
 	if (!fat32_getopt(argc, argv, argopt)) goto fail;
 
 	fm.dbg = (CMD_ARG(CMDOPT_DBGMSG) != NULL);
+#ifdef TRY_EXTENT_MAP
+	fm.blkmap = (CMD_ARG(CMDOPT_BLKMAP) != NULL);
+	if (fm.blkmap) fat32_log(FAT32_LOG_INFO, "forcing block mapping, will not try extent mapping");
+#endif
 	fm.hexdump = (CMD_ARG(CMDOPT_HEXDUMP) != NULL);
 	fm.rdzero = (CMD_ARG(CMDOPT_TESTRDZ) != NULL);
 
