@@ -104,7 +104,7 @@ fat32magic() {
 	local b f g m p q r s t u v w x
 	m="$1" && f="$2" && g="$3" && c=( "${@:4}" )
 	q=1
-	[[ "${#c[@]}" == 1 && "${#c[0]}" == 0 ]] && c=( "${c[@]:1}" ) && q=""
+	[[ "${#c[@]}" == 1 && "${#c[0]}" == 0 ]] && c=( strace -fx ) && q=""
 	[[ "${c[0]:0:1}" == "-" ]] && a=( "${c[@]}" ) && c=( ) && v=1
 	[[ "${#c[@]}" == 1 && "${#c[0]}" == 1 ]] && c=( gdb -ex run -ex bt -ex q -ex y --args )
 	if [[ "${#a[@]}" == "1" && "${a[0]:0:1}" == "-" ]]
@@ -152,8 +152,9 @@ fnmain() {
 
 	s="$((16 * 1024 * 1048576))"
 	cfgzram "$z" "$s" || return
+	# which blkdiscard &>/dev/null && ! blkdiscard -v "$z" && r="1"
 
-	g="`losetup -f`" && cfgloop "$g" "$z" || ! r="$?" || g=""
+	[[ "$r" ]] || ! g="`losetup -f`" || cfgloop "$g" "$z" || ! r="$?" || g=""
 	p="$((32 * 1048576))"
 	[[ "$r" ]] || ! f="`losetup -f`" || cfgloop "$f" "$g" "$p" || ! r="$?" || f=""
 
