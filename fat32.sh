@@ -125,7 +125,7 @@ fat32magic() {
 	x="$t/$u"
 	if [[ ! -e "$x" ]] ; then t="${0%/*}" && [[ "$0" != "$t" ]] && x="$t/$u" && [[ -e "$x" ]] || return ; fi
 	# do not make sparse e.g. bad: truncate -s 12345 "$t"
-	[[ "$v" ]] && e="$m/file.ext" && filezero "$e" 4294967295
+	[[ "$v" ]] && e="$m/longfilename.zero.ext" && filezero "$e" 4294967295
 	t="$m/fat32.c"
 	w="$m/asm.c"
 	cp -nv fat32.c "$t"
@@ -177,9 +177,10 @@ fnmain() {
 		printf '%s\n\n' "'$?'"
 		diff -sq asm.c "$t/asm.c"
 		printf '%s\n\n' "'$?'"
-		if [[ -f "$t/file.ext" ]]
+		w="$t/longfilename.zero.ext"
+		if [[ -f "$w" ]]
 		then
-			time filezero /dev/stdout 4294967295 | time diff -sq - "$t/file.ext"
+			time filezero /dev/stdout 4294967295 | time diff -sq - "$w"
 			printf '%s\n\n' "'$?'"
 		fi
 		if [[ ! "$e" ]] ; then tr -d '\000' < "$w" | diff -sq - fat32.c ; printf '%s\n\n' "'$?'" ; fi

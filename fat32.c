@@ -40,7 +40,7 @@
 #endif
 
 #ifndef ARRAY_SIZE
-#define ARRAY_SIZE(a)	(sizeof (a) / sizeof *(a))
+#define ARRAY_SIZE(a)	(sizeof (a) / sizeof (a)[0])
 #endif
 
 #define FAT32_BS		512		// min sector size
@@ -187,14 +187,10 @@ static bool fat32_badch_dirent(unsigned char uch)
 	return (fat32_dirent_badch[uch] != 0);
 }
 
-#if 0
-
 static bool fat32_badch_lfn(unsigned char uch)
 {
 	return (fat32_dirent_badch[uch] < 0);
 }
-
-#endif
 
 
 enum fat32_level {
@@ -547,8 +543,8 @@ static bool fat32_sb(struct fat32_meta *fm, uint8_t *buf, unsigned extfs[2], uns
 	bool ret = false;
 	unsigned ptbase = 0x1be, fatpte = retpte - 1, unixts = time(NULL);
 	unsigned sector_size = fm->sector_size, cluster_sectors = fm->cluster_sectors, fat32ent_per_sector = sector_size / sizeof(uint32_t);
-	unsigned rsvd_sectors = FAT32_MIN_RSVD_SECTORS, start_cluster = 2, root_dir_sectors = 32, root_dir_clusters = root_dir_sectors / cluster_sectors;
-	unsigned as, cluster_count, min_fat_sectors, fat_sectors, overlap_start_sector;
+	unsigned min = FAT32_MIN_RSVD_SECTORS, rsvd_sectors = min, start_cluster = 2, root_dir_sectors = 32, root_dir_clusters = root_dir_sectors / cluster_sectors;
+	unsigned clus, sect, cluster_count, min_fat_sectors, fat_sectors, overlap_start_sector;
 	uint8_t *ptr, *ptslot = buf + ptbase + fatpte * 16, *pttype = ptslot + 4, *ptnum = ptslot + 12;
 
 	cluster_count = extfs[1] / cluster_sectors;
@@ -559,20 +555,31 @@ static bool fat32_sb(struct fat32_meta *fm, uint8_t *buf, unsigned extfs[2], uns
 	min_fat_sectors = (0xfff0 - start_cluster) / fat32ent_per_sector;
 	fat_sectors = (cluster_count + start_cluster + root_dir_clusters + fat32ent_per_sector - 1) / fat32ent_per_sector;
 	overlap_start_sector = rsvd_sectors + fat_sectors + root_dir_sectors;
-	as = overlap_start_sector % cluster_sectors;
-	if (as != 0)
-		as = cluster_sectors - as;
-	rsvd_sectors += as;
-	overlap_start_sector += as;
+	sect = overlap_start_sector % cluster_sectors;
+	if (sect != 0)
+		sect = cluster_sectors - sect;
+	rsvd_sectors += sect;
+	overlap_start_sector += sect;
 
 	if (extfs[0] < overlap_start_sector || extfs[0] <= min_fat_sectors) { fat32_msg(fm, FAT32_LOG_FATAL, "slack too small"); goto fail; }
 	overlap_start_sector = extfs[0];
 	cluster_count = extfs[1];
 	cluster_count = (cluster_count + cluster_sectors - 1) / cluster_sectors;
 	fat_sectors = cluster_count + start_cluster + root_dir_clusters;
-	as = sector_size / sizeof(uint32_t);
-	fat_sectors = (fat_sectors + as - 1) / as;
+	fat_sectors = (fat_sectors + fat32ent_per_sector - 1) / fat32ent_per_sector;
 	rsvd_sectors = overlap_start_sector - root_dir_sectors - fat_sectors;
+
+	clus = (rsvd_sectors - min) / cluster_sectors;
+	sect = (clus + fat32ent_per_sector - 1) / fat32ent_per_sector;
+	clus -= (sect + cluster_sectors - 1) / cluster_sectors;
+	sect = (clus + fat32ent_per_sector - 1) / fat32ent_per_sector;
+	root_dir_clusters += clus;
+	root_dir_sectors = root_dir_clusters * cluster_sectors;
+	fat_sectors += sect;
+	rsvd_sectors -= sect + clus * cluster_sectors;
+	sect = (rsvd_sectors + fat_sectors) % cluster_sectors;
+	if (sect != 0)
+		rsvd_sectors += cluster_sectors - sect;
 	fat32_msg(fm, FAT32_LOG_INFO, "creating FAT32 FS: rsvd = %u, FAT = %u, root = %u, data = # %u @ %u", rsvd_sectors, fat_sectors, root_dir_clusters, cluster_count, overlap_start_sector);
 
 	if (lseek(fm->fd, 0, SEEK_SET) != 0) { perror("lseek()"); goto fail; }
@@ -889,8 +896,6 @@ static void fat32_dirent_short_part(struct fat32_dirent *dirent, unsigned idx, u
 }
 
 
-#if 0
-
 // compute checksum from short name to place in long entries
 static uint8_t fat32_cksum_short(const struct fat32_dirent *dnt)
 {
@@ -905,6 +910,8 @@ static uint8_t fat32_cksum_short(const struct fat32_dirent *dnt)
 	return sum;
 }
 
+
+#if 0
 
 // lfn must be NUL terminated, and basis buffer must hold 11 bytes and will not be terminated
 static unsigned fat32_lfn_basis(uint8_t *basis, const uint8_t *lfn)
@@ -931,14 +938,118 @@ fail:
 #endif
 
 
+// assumes # elements = 20 = ceil(255 / 13)
+static int fat32_lfn(struct fat32_dirent *dirent, const char *fpath, unsigned len)
+{
+	int ret = -1;
+	static const unsigned m[] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };	// char pos per dirent of LFN
+	unsigned p, n = ARRAY_SIZE(m), i = 0, k = 0, num = 0;
+	char tmp[sizeof *dirent], name[255], ch;
+
+	if (len > ARRAY_SIZE(name)) goto fail;
+
+	while (i < len && k < ARRAY_SIZE(name)) {
+		ch = fpath[i++];
+		if (fat32_badch_lfn(ch)) continue;
+		name[k++] = ch;
+	}
+	if (k == 0) goto fail;
+
+	p = k - 1;
+	p -= p % n;
+
+	while (k > 0 && num < (ARRAY_SIZE(name) + n - 1) / n) {
+		memset(tmp, 0, sizeof tmp);
+		i = 0;
+		while (i < n && p < k) {
+			tmp[m[i]] = name[p++];
+			tmp[m[i++] + 1] = 0;
+		}
+		if (num == 0 && i < n) {
+			tmp[m[i]] = 0x00;
+			tmp[m[i++] + 1] = 0x00;
+			while (i < n) {
+				tmp[m[i]] = 0xff;
+				tmp[m[i++] + 1] = 0xff;
+			}
+		}
+		memcpy(&dirent[num++], tmp, sizeof *dirent);
+		k--;
+		k -= k % n;
+		p = k - n;
+	}
+
+	ret = num;
+fail:
+	return ret;
+}
+
+
+// expects # elements = 21 = LFN + short
+static int fat32_name(struct fat32_dirent *dirarr, unsigned first_cluster, unsigned filesize, const char *fpath)
+{
+	int ret = -1, slash = -1, dot = -1, amt;
+	uint8_t cksum;
+	unsigned i, k, num = 0, fpathlen = strlen(fpath);
+	struct fat32_dirent dirent = { 0 };
+	struct fat32_lfnent lfnent;
+
+	if (fpathlen == 0) goto fail;
+
+	dirent.name[0] = '_';
+	memset(dirent.name + 1, ' ', sizeof dirent.name - 1);
+	dirent.attr = FAT32_ATTR_RO;
+	fat32_wr16(&dirent.clusthi, first_cluster >> 16);
+	fat32_wr16(&dirent.clustlo, first_cluster);
+	fat32_wr32(&dirent.filesz, filesize);
+
+	for (k = 0; k < fpathlen && (slash < 0 || dot < 0); k++) {
+		i = fpathlen - 1 - k;
+		switch (fpath[i]) {
+		case '/':
+			if (slash < 0) slash = i;
+			dot = -1;
+			break;
+		case '.':
+			if (dot < 0) dot = i;
+			break;
+		default:
+			break;
+		}
+	}
+
+	amt = fat32_lfn(dirarr, fpath + slash + 1, fpathlen - slash - 1);
+	if (amt <= 0) goto fail;
+	num = amt;
+
+	fat32_dirent_short_part(&dirent, 0, 8, fpath, fpathlen, slash + 1);
+	fat32_dirent_short_part(&dirent, 8, 11, fpath, fpathlen, dot + 1);
+
+	cksum = fat32_cksum_short(&dirent);
+
+	for (i = 0; i < num; i++) {
+		memcpy(&lfnent, &dirarr[i], sizeof lfnent);
+		lfnent.ord = (num - i) | ((i == 0) ? FAT32_LFN_ORD_LAST : 0);
+		lfnent.attr = FAT32_ATTR_LFN;
+		lfnent.cksum = cksum;
+		memcpy(&dirarr[i], &lfnent, sizeof *dirarr);
+	}
+	memcpy(&dirarr[num++], &dirent, sizeof *dirarr);
+
+	ret = num;
+fail:
+	return ret;
+}
+
+
 // pass path to link file blocks into FAT32
 static bool fat32_file(struct fat32_meta *fm, const char *fpath)
 {
 	bool ret = false;
-	int retblks, i, fd = -1, slash = -1, dot = -1;
-	unsigned k, blkcount, blk = 0, cluster = 0, first_cluster = 0, fpathlen = strlen(fpath);
+	int retblks, num, i, fd = -1;
+	unsigned k, blkcount, blk = 0, cluster = 0, first_cluster = 0;
 	uint8_t *pfat = (uint8_t *)fm->ptr + fm->rsvd_sectors * (unsigned long long)fm->sector_size, *pdir = pfat + fm->fat_sectors * (unsigned long long)fm->sector_size;
-	struct fat32_dirent dirent = { 0 };
+	struct fat32_dirent dirent[21];
 	struct stat st;
 
 	fd = open(fpath, O_RDONLY);
@@ -974,35 +1085,21 @@ static bool fat32_file(struct fat32_meta *fm, const char *fpath)
 
 	if (cluster != 0) fat32_wr32(pfat + cluster * sizeof(uint32_t), FAT32_CLUSTER_END);
 
-	dirent.name[0] = '_';
-	memset(dirent.name + 1, ' ', sizeof dirent.name - 1);
-	dirent.attr = FAT32_ATTR_RO;
-	fat32_wr16(&dirent.clusthi, first_cluster >> 16);
-	fat32_wr16(&dirent.clustlo, first_cluster);
-	fat32_wr32(&dirent.filesz, st.st_size);
-
-	for (k = 0; k < fpathlen && (slash < 0 || dot < 0); k++) {
-		i = fpathlen - 1 - k;
-		switch (fpath[i]) {
-		case '/':
-			if (slash < 0) slash = i;
-			break;
-		case '.':
-			if (dot < 0) dot = i;
-			break;
-		default:
-			break;
-		}
+	num = fat32_name(dirent, first_cluster, st.st_size, fpath);
+	if (num < 0) {
+		fat32_msg(fm, FAT32_LOG_FATAL, "bad filename '%s'\n", fpath);
+		goto fail;
 	}
 
-	fat32_dirent_short_part(&dirent, 0, 8, fpath, fpathlen, slash + 1);
-	fat32_dirent_short_part(&dirent, 8, 11, fpath, fpathlen, dot + 1);
-
-	for (k = 0; k < fm->root_dir_clusters * fm->sector_size; k += sizeof dirent, pdir += sizeof dirent) {
+	for (i = 0, k = 0; k < fm->root_dir_clusters * fm->sector_size; k += sizeof *dirent, pdir += sizeof *dirent) {
 		if (*pdir == FAT32_DIRENT_FREE) {
-			memcpy(pdir, &dirent, sizeof dirent);
-			break;
+			memcpy(pdir, &dirent[i++], sizeof *dirent);
+			if (i == num) break;
 		}
+	}
+	if (i != num) {
+		fat32_msg(fm, FAT32_LOG_FATAL, "insufficient space for directory entry\n");
+		goto fail;
 	}
 
 success:
