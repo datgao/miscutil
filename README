@@ -2,6 +2,30 @@
 Run make to build any or all of the components.  (There is no install target.)
 32-bit sub-architecture and cross compiles are supported.
 
+- asm
+Heavily inspired by work of Christopher Domas presented at DEFCON 25.  This tool
+observes instruction lengths and can search breadth-first or depth-first.  It
+displays fault reason and address with e.g. likely stack access or jump taken.
+The code configures an alternate signal stack and memory maps the physical page
+that holds the instruction to separate virtual RX and RW pages.  Runs about 30 %
+faster if Linux boots with 'nopti' option.  (Logic that crudely filters out FS
+register usage exists to prevent fatal segfaults during signal handling.  As a
+wild guess, this might be related to thread-local storage and alternate stack
+access i.e. may crash trying to find the appropriate thread's alternate stack.)
+
+- fat32
+Prepend FAT32 metadata before EXT4 partition (or other FS) to ease compatibility
+between platforms without copying file data.  It creates a FAT32 FS that
+overlaps with the source FS and map files specified from standard input.  This
+usually requires at least 0.1 % space reserved before the source partition.  The
+source FS is not converted irreversibly and attempts are made to prevent writing
+to the FAT32 alias.  Use this tool if you do not value your data and really want
+to lose all of it on the first run.  :)
+
+- asp2txt.awk
+Convert IR readings from one text-based format to another, optionally convert
+units, and write average to standard output from input set e.g. same sample.
+
 - stdansi
 Run a program with stdansi to highlight its standard error stream, inspired by
 https://github.com/charliesome/errexec
