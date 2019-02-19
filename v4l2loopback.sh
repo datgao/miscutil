@@ -15,6 +15,7 @@ ffv4l2() {
 	r="${3:-"15"}"
 	s="${4:-"1280x960"}"
 	n="$#"
+	# XXX TODO: the above appears to be used below, but in a buggy way
 	[[ "$n" == "0" ]] || p="${@:n}"
 	ffmpeg -analyzeduration 0 -f video4linux2 -video_size "$s" -input_format mjpeg -framerate "$r" -i "$v" -vcodec rawvideo -pix_fmt yuv420p -vf transpose="${p:-"clock"}" -f v4l2 "$t"
 }

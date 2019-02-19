@@ -1,37 +1,38 @@
-- Build
++ Build
 Run make to build any or all of the components.  (There is no install target.)
-32-bit sub-architecture and cross compiles are supported.
+32-bit sub-architecture and cross compiles are supported.  Makefile attempts to
+group Linux-specific targets separate from more portable Unix code.
 
 - asm
 Heavily inspired by work of Christopher Domas presented at DEFCON 25.  This tool
 observes instruction lengths and can search breadth-first or depth-first.  It
 displays fault reason and address with e.g. likely stack access or jump taken.
 The code configures an alternate signal stack and memory maps the physical page
-that holds the instruction to separate virtual RX and RW pages.  Runs about 30 %
-faster if Linux boots with 'nopti' option.  (Logic that crudely filters out FS
-register usage exists to prevent fatal segfaults during signal handling.  As a
-wild guess, this might be related to thread-local storage and alternate stack
-access i.e. may crash trying to find the appropriate thread's alternate stack.)
+that holds the instruction to separate virtual RX and RW pages.
+The code runs about 30 % faster if Linux boots with 'nopti' or 'pti=off' option,
+due to heavy reliance on signal delivery and overhead from kernel and user space
+transitions.  (Cargo cult reasoning suggests that 'nospectre_v1 nospectre_v2
+spectre_v2=off spectre_v2_user=off spec_store_bypass_disable=on' may further
+improve performance.
+Note: limitations require logic that crudely filters out FS register usage in
+order to prevent fatal segfaults during signal handling.  As a wild guess, this
+might be related to thread-local storage and alternate stack access i.e. may
+crash trying to find the appropriate thread's alternate stack, perhaps due to
+implied sigreturn() syscall by glibc, or the shared signal code path only masks
+the delivered signal and not all registered signals.
 
-- fat32
-Prepend FAT32 metadata before EXT4 partition (or other FS) to ease compatibility
-between platforms without copying file data.  It creates a FAT32 FS that
-overlaps with the source FS and map files specified from standard input.  This
-usually requires at least 0.1 % space reserved before the source partition.  The
-source FS is not converted irreversibly and attempts are made to prevent writing
-to the FAT32 alias.  Use this tool if you do not value your data and really want
-to lose all of it on the first run.  :)
+* asp2txt.awk
+Convert infrared measurements from one text-based format to another, optionally
+convert units, and write average of readings to standard output from input set
+e.g. all files describe the same sample.  (Slightly awful bash script which runs
+AWK script from heredoc.)
 
-- asp2txt.awk
-Convert IR readings from one text-based format to another, optionally convert
-units, and write average to standard output from input set e.g. same sample.
+* blank_display.sh
+Turn off backlight without screensaver.
 
-- stdansi
-Run a program with stdansi to highlight its standard error stream, inspired by
-https://github.com/charliesome/errexec
-
-- resparse
-Free zeroed blocks in files with resparse.
+* cpu.sh
+Manually select CPU settings, like throttle_cpu.sh but without automatic
+state management.
 
 - dbz
 Discard a block device with dbz and check if it will returns zeroes.
@@ -48,34 +49,132 @@ many SD cards and eMMC modules.
 	pv -ptrabfeWB "$bsz" /path/to/disk.img | \
 	dd iflag=fullblock bs="$bsz" ${z:+"conv=sparse"} oflag=direct of="$devpath"
 
+* ddj.sh
+Wrap SSH using ProxyCommand to measure and optionally limit inbound and outbound
+throughput, e.g. limit traffic bandwidth for video upload or download incl. when
+bufferbloat is unavoidable -- requires 'pv' (pipeviewer).
+
+* duty.sh
+Obsolete shell script version of 'kira' below, but has high overhead due to
+fork() and exec() to run 'kill' command.
+
+* empty.sh
+#####
+#####
+#####
+
+- fat32
+Prepend FAT32 metadata before EXT4 partition (or other FS) to ease compatibility
+between platforms without copying file data.  It creates a FAT32 FS that
+overlaps with the source FS and map files specified from standard input.  This
+usually requires at least 0.1 % space reserved before the source partition.  The
+source FS is not converted irreversibly and attempts are made to prevent writing
+to the FAT32 alias.
+Use this tool if you do not value your data and really want to lose all of it on
+the very first run.  :)
+
+* glom.sh
+Like 'pc.sh' below but assumes that files with similar suffix incl. extension
+should be grouped together to achieve better compression.
+
+- kira
+Enforce maximum CPU duty cycle of processes via specified PIDs with time slices
+specified in millisecond precision.  Also can toggle CPU "turbo" boost feature
+and/or frequency scaling governor.
+
 - ksm.sh, madvmerge.sh, libmadvmerge.so
-Hook memory allocation library calls to mark identical user memory pages
-as mergeable, toggle kernel same page merging state, and check stats.
+Hook memory allocation library calls to mark identical user memory pages as
+mergeable, toggle kernel same page merging state, and check stats.
+
+* line2tsv.sh
+Convert lined text from files to parallel columns in TSV on standard output.  It
+was written to ease analysis of results from asp2txt.awk by producing a format
+which is easily imported as one spreadsheet.
+
+* network-manager-gnome.sh
+Restart gnome panel, network manager and its applet, and optionally other items
+to cope with memory leaks.  This probably has broken logic which should pass
+environment variables from user to root, but which may not correctly communicate
+complete session information on newer distributions.
 
 - nocache.sh, libnocache.so
 Avoid caching file content in memory.
 Both libmadvmerge.so and libnocache.so are based on
 https://www.flamingspork.com/projects/libeatmydata/
 
-- sudoers
+* p.sh
+Poll whether running on AC, and if switched to battery beyond timer threshold
+then sleep, but wake up periodically to re-check and remain awake if AC
+has been restored.  This is useful if your power delivery might be unreliable
+and background tasks are running, or otherwise manually sleeping too frequently
+just breaks ACPI hotkey events e.g. volume control.
+
+* pc.sh
+Copy like 'cp' recursively, but uses tar streams and progress bar with ETA,
+needs 'pv' (pipeviewer).
+
+- resparse
+Free zeroed blocks in files, but avoids copying non-zero data blocks e.g. as in
+cp --sparse=always infile outfile.  Do not run this tool when another process is
+writing to the same file, because race conditions exist where sparse holes can
+be punched over very newly written non-zero data, which will cause data loss.
+
+* snoozer.sh
+Lock session and suspend.  On resume, wait for user to unlock, and sleep
+again on timeout.  This is useful if you leave your laptop open, running without
+AC power, and your feline friend walks on the keyboard, causing it to wake up
+and otherwise drain the battery.
+
+- stdansi
+Run a program with stdansi to highlight its standard error stream, inspired by
+https://github.com/charliesome/errexec
+
+~ sudoers
 Grant root permissions without password for snoozer.sh, throttle_cpu.sh,
 and toggle_backlight.sh.
 
-- blank_display.sh
-Turn off backlight without screensaver.
-
-- snooze.sh and helper snoozer.sh
-Lock session and suspend.  On resume, wait for user to unlock, and sleep
-again on timeout.
-
-- throttle_cpu.sh
+* throttle_cpu.sh
 Compromise across CPU performance/power/thermal targets.
 1. Performance: ondemand, online, turbo boost, active - snappy
 2. Battery: powersave, online, no turbo boost, active - tolerable
 3. Fan: powersave, offline, no turbo boost, limit load - beyond slow
 
-- toggle_backlight.sh
-Switch bright/dim display.
+* toggle_backlight.sh
+Switch display backlight between bright, dim, and off.
 
-- zramoff.sh
+* vad.sh
+Record audio input to FLAC files.  Optionally record timestamps and ranges of
+silence, which requires the 'silan' utility.  Perhaps useful if you want to find
+intermittent noise (or your own snoring patterns).
+
+* v4l2loopback.sh
+This script rotates webcam input to provide a rotated alternate virtual device,
+but note that several values are hard-coded.  This general approach converts
+input to commonly anticipated uncompressed pixel formats, which can ease Skype
+compatibility.  Unfortunately, the V4L2 API does not support dynamically
+notifying applications of rotation e.g. cued from an accelerometer, so the user
+must switch inputs manually as desired.
+An optional X11 capture allows for screen sharing without native support in your
+video call/conferencing application.  
+It loads the kernel module for v4l2loopback, so it expects that v4l-utils and
+v4l2loopback-dkms have been Installed already.  The script must be run once also
+to configure exposed resolutions, but may be stopped when the consumer no longer
+needs transcoded output.
+
+* vp.sh
+Wraps 'pv' (pipeviewer) with default options, and forces progress bar to scroll
+so that history is visible mixed with other pipeline output, which also prevents
+overwriting output.
+
+* w.sh
+Display system component temperatures and possibly power consumption.
+
+* wlch.sh
+Wi-Fi helper to create or set monitor mode, with optional channel hopping and a
+mode to cooperate when associated to an AP.
+
+* x.sh
+Enable scrolling keys on some tablets by mapping to arrow up/down.
+
+* zramoff.sh
 Empty zram swap and restart zram-config service.

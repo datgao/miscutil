@@ -144,6 +144,9 @@ struct fat32_meta {
 	unsigned	fsblksz;		// block size of mounted FS
 	dev_t		devid;			// device ID of mounted FS
 
+	char		dirpath[256];		// working path
+	unsigned	last_cluster;		// current final cluster of directory
+
 	bool		quiet;			// log only errors and warnings
 	bool		dbg;			// debug messages
 	bool		direct;			// modify on the fly - do not buffer changes in private memory
@@ -163,6 +166,9 @@ struct fat32_meta {
 
 	unsigned	cluster[FAT32_BATCH_CLUSTER];	// split out extents up to limit - if full then some extents may remain
 };
+
+
+static const unsigned fat32_lfnchar_offt2pos[] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };	// char pos per dirent of LFN
 
 
 #define CMD_NCH			(1 << 8)
@@ -728,7 +734,7 @@ static int fat32_blk(int fd, unsigned blkstart, unsigned blkcount, struct fat32_
 		fm->cluster[i] = blkstart++;
 		if (ioctl(fd, FIBMAP, &fm->cluster[i]) != 0) { perror("ioctl(FIBMAP)"); goto fail; }
 		if (fm->cluster[i] == 0) { fat32_msg(fm, FAT32_LOG_FATAL, "unexpected special or non-contiguous block"); goto fail; }
-		fm->cluster[i] = (unsigned long long)fm->cluster[i] * fm->cluster_size / fm->fsblksz + fm->start_cluster + fm->root_dir_clusters;
+		fm->cluster[i] = fm->cluster[i] * (unsigned long long)fm->cluster_size / fm->fsblksz + fm->start_cluster + fm->root_dir_clusters;
 	}
 	ret = blkcount;
 fail:
@@ -815,6 +821,7 @@ fail:
 #endif
 
 
+// map range of logical file blocks to physical device blocks into internal array - wrap underlying kernel interface
 static int fat32_clusters(int fd, unsigned blkstart, unsigned blkcount, struct fat32_meta *fm)
 {
 	int ret = -1;
@@ -854,7 +861,7 @@ fail:
 }
 
 
-// clean up
+// clean up memory mapping of device file
 static bool fat32_unmap(struct fat32_meta *fm)
 {
 	bool ret = true;
@@ -868,6 +875,8 @@ static bool fat32_unmap(struct fat32_meta *fm)
 	return ret;
 }
 
+
+// close device file
 static bool fat32_free(struct fat32_meta *fm)
 {
 	bool ret = fat32_unmap(fm);
@@ -878,21 +887,6 @@ static bool fat32_free(struct fat32_meta *fm)
 	}
 
 	return ret;
-}
-
-
-static void fat32_dirent_short_part(struct fat32_dirent *dirent, unsigned idx, unsigned len, const char *fpath, unsigned fpathlen, unsigned pos)
-{
-	char ch;
-
-	while (idx < len && pos > 0 && pos < fpathlen) {
-		ch = fpath[pos++];
-		if (ch == '/' || ch == '.') break;
-		if (fat32_badch_dirent(ch)) continue;
-		if (ch == (char)FAT32_DIRENT_DEL) ch = FAT32_DIRENT_SUB;
-		if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
-		dirent->name[idx++] = ch;
-	}
 }
 
 
@@ -911,9 +905,259 @@ static uint8_t fat32_cksum_short(const struct fat32_dirent *dnt)
 }
 
 
+// return length of specified 8.3 short name component, else 0 if unused, or < 0 on error incl. LFN entry
+static int fat32_dirent_short_ext(const struct fat32_dirent *dirent, int is_base)
+{
+	int ret = -1, len = 0, i, t, pos = is_base ? 0 : 8, size = is_base ? 8 : 3, max = pos + size;
+
+	if (dirent->attr == FAT32_ATTR_LFN || dirent->name[0] == FAT32_DIRENT_PAD) goto fail;
+	if (dirent->name[0] == FAT32_DIRENT_DEL || dirent->name[0] == FAT32_DIRENT_FREE) goto success;
+
+	for (i = pos; i < max; i++) {
+		if (dirent->name[i] == FAT32_DIRENT_PAD) {
+			for (t = i; t < max; t++) {
+				if (dirent->name[t] != FAT32_DIRENT_PAD) goto fail;
+			}
+			break;
+		}
+		if (fat32_badch_dirent(dirent->name[i])) goto fail;
+	}
+
+	len = i - pos;
+success:
+	ret = len;
+fail:
+	return ret;
+}
+
+
+// return length of short name extracted into buffer, else 0 if unused, or < 0 on error incl. LFN entry
+static int fat32_dirent_short_name(char *buf, int size, const struct fat32_dirent *dirent)
+{
+	int ret = -1, len = 0, base, ext;
+
+	if (buf == NULL || size <= 8 + 3) goto fail;
+	*buf = '\0';
+
+	base = fat32_dirent_short_ext(dirent, 1);
+	if (base < 0) goto fail;
+	if (base == 0) goto success;
+
+	ext = fat32_dirent_short_ext(dirent, 0);
+	if (ext < 0) goto fail;
+
+	len = snprintf(buf, size, "%c" "%.*s" "." "%.*s"
+	, dirent->name[0] == FAT32_DIRENT_SUB ? FAT32_DIRENT_DEL : dirent->name[0]
+	, base - 1, dirent->name + 1, ext, dirent->name + 8);	// TODO: only substitute first?
+success:
+	ret = len;
+fail:
+	return ret;
+}
+
+
+// return entries to skip for extracted short/long name or empty string from 2 adjacent extents, else 0 if already end of input, or < 0 on error
+static int fat32_lfn_string(char *buf, int size, const struct fat32_dirent *dirarr[2], unsigned dirnum[2])
+{
+	int ret = -1, len = 0, rv = 0;
+	bool is_short = true;
+	static const unsigned *const lfnch_offt2pos = fat32_lfnchar_offt2pos;
+	unsigned ord, cksum, b, d, i, k, p, r, s = 0, t = dirnum[0] + dirnum[1], lfnch_offt2pos_num = ARRAY_SIZE(fat32_lfnchar_offt2pos);
+	const struct fat32_dirent *dirent;
+	struct fat32_lfnent lfnent;
+	unsigned char tmp[sizeof *dirent];
+
+	if (dirnum[0] == 0 || size <= 255) goto fail;
+
+	for (d = 0, b = 0, r = 0; d < 2; d++) {
+		for (i = 0, dirent = dirarr[d]; i < dirnum[d]; i++, dirent++, b++) {
+			switch (dirent->name[0]) {
+			case FAT32_DIRENT_FREE:
+				goto out;	// end of directory - return empty name and zero consumed
+			case FAT32_DIRENT_DEL:
+				is_short = true;
+				break;
+			default:
+				switch (dirent->attr) {
+				case FAT32_ATTR_VOL:
+					is_short = true;
+					break;
+				case FAT32_ATTR_LFN:
+					memcpy(&lfnent, dirent, sizeof lfnent);
+					if (r != 0 && ((lfnent.ord & FAT32_LFN_ORD_LAST) != 0 || lfnent.ord != ord - r || cksum != lfnent.cksum)) {
+						is_short = true;
+						r = 0;
+					}
+					if (r == 0) {
+						cksum = lfnent.cksum;
+						ord = lfnent.ord;
+						is_short = ((ord & FAT32_LFN_ORD_LAST) == 0);	// reset - maybe
+						if ((ord &= ~FAT32_LFN_ORD_LAST) == 0 || ord > FAT32_LFN_ORD_LAST) is_short = true;
+					}
+					break;
+				default:			// basic short entry (or caller misplaced offset)
+					rv = fat32_dirent_short_name(buf, size, dirent);
+					if (rv <= 0) goto fail;	// invalid, or unused but checked above
+					s = rv;			// single entry
+					if (r != ord) is_short = true;
+					goto next;		// finish loop - try any long name below
+				}
+			}
+			if (++r > (255 + 13 - 1) / 13) goto fail;
+			if (is_short) r = 0;
+		}
+	}
+
+	if (b == t) { len = b; goto out; }	// exhausted input - return empty name and total count as sentinel
+	abort();	// assert - not reachable
+
+next:
+	if (is_short || cksum != fat32_cksum_short(dirent)) goto success;
+
+	for (d = 0; d < 2; d++) {
+		for (k = 0; k < r; k++) {
+			dirent = (r - k <= dirnum[0]) ? (dirarr[0] + r - k - 1) : (dirarr[1] + r - k - 1 - dirnum[0]);
+			memcpy(tmp, dirent, sizeof tmp);
+
+			for (p = 0; p < lfnch_offt2pos_num; p++, s++) {
+				if (s >= (unsigned)size) goto fail;
+
+				buf[s] = tmp[lfnch_offt2pos[p]];
+				if (tmp[lfnch_offt2pos[p++] + 1] != 0) goto fail;	// ASCII approximation
+
+				if (buf[s++] == 0) {					// terminator if any (or corrupted)
+					if (k + 1 != r) goto fail;
+					while (p < lfnch_offt2pos_num) {		// verify pad
+						if (tmp[lfnch_offt2pos[p]] != 0xff || tmp[lfnch_offt2pos[p++] + 1] != 0xff) goto fail;
+					}
+					goto success;
+				}
+			}
+		}
+	}
+
+success:
+	if (s == 0 && rv >= 0) s = rv;
+	len = b + 1;	// skip LFN and short entries
+out:
+	buf[s] = '\0';
+	ret = len;
+fail:
+	return ret;
+}
+
+
+// return cluster of directory by name, else 0 if end of input, or < 0 on error
+static unsigned fat32_dir_cluster(struct fat32_meta *fm, unsigned cluster, const char *dirname, unsigned len)
+{
+	int rlen;
+	const struct fat32_dirent *dirent, *dirarr[2];
+	struct fat32_dirent dirtmp[(255 + 13 - 1) / 13];
+	char name[256];
+	unsigned ret = 0, num, pos, rem, slot, skip = 0, dirnum[2], n = ARRAY_SIZE(name), t = ARRAY_SIZE(dirtmp);
+	const uint8_t *pfat = fm->ptr + fm->rsvd_sectors * (unsigned long long)fm->sector_size, *pdir = pfat + fm->fat_sectors * (unsigned long long)fm->sector_size;
+
+	(void)len;	// TODO
+
+	if (cluster >= FAT32_CLUSTER_BAD) goto fail;
+
+	while (1) {
+		if (cluster < fm->start_cluster) goto fail;
+
+		pos = 0;
+		while (1) {
+			slot = (pos < skip) ? 0 : (pos - skip);
+			rem = fm->cluster_size / sizeof *dirent - slot;
+			dirent = (const struct fat32_dirent *)(pdir + cluster * (unsigned long long)fm->cluster_size) + slot;
+			dirarr[0] = dirtmp + t - skip;
+			dirnum[0] = skip;
+			dirarr[1] = dirent;
+			dirnum[1] = rem;
+			if (dirnum[0] == 0) {
+				dirarr[0] = dirarr[1];
+				dirnum[0] = dirnum[1];
+			}
+			rlen = fat32_lfn_string(name, n, dirarr, dirnum);
+			if (rlen < 0) goto fail;
+			num = rlen;
+
+			dirent = (pos < dirnum[0]) ? (dirarr[0] + pos) : (dirarr[1] + pos - dirnum[0]);
+			if (num == 0) {
+				if (cluster == FAT32_CLUSTER_END) goto success;
+				if (skip >= t || cluster >= FAT32_CLUSTER_BAD) goto success;	// allow unused - TODO: fail otherwise
+				if (rem > t - skip) rem = t - skip;
+				if (skip != 0) memmove(dirtmp + t - rem, dirtmp + t - skip, skip);
+				memcpy(dirtmp + t - skip, dirent + slot, rem * sizeof *dirent);
+				skip += rem;
+				break;			// read another cluster
+			}
+			if (skip < num) {
+				num -= skip;
+				skip = 0;
+			} else {
+				skip -= num;
+				num = 0;
+			}
+
+			if (strcasecmp(name, dirname) == 0) {
+				dirent += pos - 1;	// held in short entry
+				cluster = fat32_rd16(&dirent->clusthi) << 16;
+				cluster |= fat32_rd16(&dirent->clustlo);
+				ret = cluster;
+				goto fail;		// found - TODO: or maybe zero?
+			}
+			pos += num;
+		}
+
+		cluster = fat32_rd32(pfat + cluster * sizeof(uint32_t));
+	}
+
+success:
+	ret = 0;
+fail:
+	return ret;
+}
+
+
 #if 0
 
-// lfn must be NUL terminated, and basis buffer must hold 11 bytes and will not be terminated
+// return cluster of file or directory by path, else 0 if end of input, or < 0 on error
+static unsigned fat32_path_cluster(struct fat32_meta *fm, const char *dirpath, unsigned len)
+{
+	unsigned ret = 0, cluster;
+
+	if (len == 0) goto fail;
+
+	cluster = fm->start_cluster;	// beginning of root dir cluster chain
+	
+
+	ret = cluster;
+fail:
+	return ret;
+}
+
+#endif
+
+
+// convert substring of path to specified component of 8.3 short name - expects filled with spaces, sane lengths, no NUL terminators
+static void fat32_dirent_short_part(struct fat32_dirent *dirent, unsigned idx, unsigned len, const char *fpath, unsigned fpathlen, unsigned pos)
+{
+	char ch;
+
+	while (idx < len && pos > 0 && pos < fpathlen) {
+		ch = fpath[pos++];
+		if (ch == '/' || ch == '.') break;
+		if (fat32_badch_dirent(ch)) continue;
+		if (ch == (char)FAT32_DIRENT_DEL) ch = FAT32_DIRENT_SUB;
+		if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
+		dirent->name[idx++] = ch;
+	}
+}
+
+
+#if 0
+
+// LFN must be NUL terminated, expects basis buffer will hold 11 bytes, and will NOT terminate as string
 static unsigned fat32_lfn_basis(uint8_t *basis, const uint8_t *lfn)
 {
 	unsigned ret = 0, pos = 0;
@@ -938,45 +1182,45 @@ fail:
 #endif
 
 
-// assumes # elements = 20 = ceil(255 / 13)
+// return LFN entries populated from name, or < 0 on error - assumes # elements = 20 = ceil(255 / 13)
 static int fat32_lfn(struct fat32_dirent *dirent, const char *fpath, unsigned len)
 {
 	int ret = -1;
-	static const unsigned m[] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };	// char pos per dirent of LFN
-	unsigned p, n = ARRAY_SIZE(m), i = 0, k = 0, num = 0;
-	char tmp[sizeof *dirent], name[255], ch;
+	static const unsigned *const lfnch_offt2pos = fat32_lfnchar_offt2pos;
+	char tmp[sizeof *dirent], name[256], ch;
+	unsigned p, i = 0, k = 0, num = 0, s = ARRAY_SIZE(name), lfnch_offt2pos_num = ARRAY_SIZE(fat32_lfnchar_offt2pos);
 
-	if (len > ARRAY_SIZE(name)) goto fail;
+	if (len >= s) goto fail;			// oversized name
 
-	while (i < len && k < ARRAY_SIZE(name)) {
+	while (i < len && k < s) {
 		ch = fpath[i++];
 		if (fat32_badch_lfn(ch)) continue;
 		name[k++] = ch;
 	}
 	if (k == 0) goto fail;
 
-	p = k - 1;
-	p -= p % n;
+	p = k - 1;					// begin at end of name
+	p -= p % lfnch_offt2pos_num;			// adjust to start of first short dirent i.e. last logical dirent
 
-	while (k > 0 && num < (ARRAY_SIZE(name) + n - 1) / n) {
+	while (k > 0 && num < (s + lfnch_offt2pos_num - 1) / lfnch_offt2pos_num) {
 		memset(tmp, 0, sizeof tmp);
 		i = 0;
-		while (i < n && p < k) {
-			tmp[m[i]] = name[p++];
-			tmp[m[i++] + 1] = 0;
+		while (i < lfnch_offt2pos_num && p < k) {
+			tmp[lfnch_offt2pos[i]] = name[p++];
+			tmp[lfnch_offt2pos[i++] + 1] = 0;	// TODO: assumes ASCII input
 		}
-		if (num == 0 && i < n) {
-			tmp[m[i]] = 0x00;
-			tmp[m[i++] + 1] = 0x00;
-			while (i < n) {
-				tmp[m[i]] = 0xff;
-				tmp[m[i++] + 1] = 0xff;
+		if (num == 0 && i < lfnch_offt2pos_num) {
+			tmp[lfnch_offt2pos[i]] = 0x00;
+			tmp[lfnch_offt2pos[i++] + 1] = 0x00;	// terminate if room
+			while (i < lfnch_offt2pos_num) {
+				tmp[lfnch_offt2pos[i]] = 0xff;
+				tmp[lfnch_offt2pos[i++] + 1] = 0xff;	// pad any space beyond
 			}
 		}
-		memcpy(&dirent[num++], tmp, sizeof *dirent);
+		memcpy(&dirent[num++], tmp, sizeof *dirent);	// copy from scratch and advance
 		k--;
-		k -= k % n;
-		p = k - n;
+		k -= k % lfnch_offt2pos_num;
+		p = k - lfnch_offt2pos_num;			// jump back name segment discontinuously
 	}
 
 	ret = num;
@@ -985,7 +1229,7 @@ fail:
 }
 
 
-// expects # elements = 21 = LFN + short
+// return long and short entries populated from base name of path, or < 0 on error - expects # elements = 21 = LFN + short
 static int fat32_name(struct fat32_dirent *dirarr, unsigned first_cluster, unsigned filesize, const char *fpath)
 {
 	int ret = -1, slash = -1, dot = -1, amt;
@@ -1020,7 +1264,7 @@ static int fat32_name(struct fat32_dirent *dirarr, unsigned first_cluster, unsig
 
 	amt = fat32_lfn(dirarr, fpath + slash + 1, fpathlen - slash - 1);
 	if (amt <= 0) goto fail;
-	num = amt;
+	num = amt;						// short components w/o sequence or checksum
 
 	fat32_dirent_short_part(&dirent, 0, 8, fpath, fpathlen, slash + 1);
 	fat32_dirent_short_part(&dirent, 8, 11, fpath, fpathlen, dot + 1);
@@ -1034,7 +1278,7 @@ static int fat32_name(struct fat32_dirent *dirarr, unsigned first_cluster, unsig
 		lfnent.cksum = cksum;
 		memcpy(&dirarr[i], &lfnent, sizeof *dirarr);
 	}
-	memcpy(&dirarr[num++], &dirent, sizeof *dirarr);
+	memcpy(&dirarr[num++], &dirent, sizeof *dirarr);	// place alternate short name last
 
 	ret = num;
 fail:
@@ -1091,7 +1335,7 @@ static bool fat32_file(struct fat32_meta *fm, const char *fpath)
 		goto fail;
 	}
 
-	for (i = 0, k = 0; k < fm->root_dir_clusters * fm->sector_size; k += sizeof *dirent, pdir += sizeof *dirent) {
+	for (i = 0, k = 0; k < fm->root_dir_clusters * (unsigned long long)fm->sector_size; k += sizeof *dirent, pdir += sizeof *dirent) {
 		if (*pdir == FAT32_DIRENT_FREE) {
 			memcpy(pdir, &dirent[i++], sizeof *dirent);
 			if (i == num) break;
